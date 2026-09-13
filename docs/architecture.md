@@ -3,6 +3,11 @@
 A redesign of the media pipeline, replacing the current arrangement rather than patching it.
 Written against the live setup recorded in `homelab-setup.md`.
 
+**Status: agreed, nothing implemented yet.** Next step is the gatekeeper rewrite for §2 — the
+qBittorrent completion trigger, the scan-based import, the reconcile loop against qBittorrent's
+API, and a `/translate` endpoint for Bazarr's existing hook. `ai_translator.py` in the repo root
+is the current service: correct for the old post-import design, not yet for this one.
+
 Goals it is built to meet:
 - Fully automated from a Jellyseerr request to a finished file in Jellyfin.
 - One write to the library pool, ever — the file is final before it is written.
