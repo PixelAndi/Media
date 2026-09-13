@@ -91,11 +91,52 @@ curl -s -H "X-Api-Key: $WEBHOOK_SECRET" localhost:5000/api/jobs | jq '.[] | {sou
 journalctl -u ai-translator -f
 ```
 
-## Known limitation: ongoing series
+## Tests
+
+```bash
+python3 tests/test_pipeline_e2e.py      # full flow on real media, stubbed Gemini/*arr
+python3 tests/test_failure_paths.py     # auth, validation, timeouts, schema migration
+```
+
+Both build real files with ffmpeg in a temp directory and need `ffmpeg`/`ffprobe` on `PATH`.
+The e2e run includes an SVT-AV1 encode standing in for Tdarr, so it takes a minute.
+
+## Known limitation: ongoing series (fix agreed, not yet built)
 
 Moving a series to the cold root changes its root folder in Sonarr, so the *next* episode of
-that series is imported straight into `/library/tv/...` rather than `/arr-ingest`. The pipeline
-still runs for it — the webhook path is used wherever it points, and the move step is skipped
-when the item is already in the target root — but that episode is transcoded in place on the
-cold (SMR) disk instead of on the ingest pool. If that write pattern matters, the alternative is
-to keep series permanently in the hot root and let Jellyfin read both locations.
+that series imports straight into `/library/tv/...` rather than `/arr-ingest`. The pipeline
+still runs for it — the move step is skipped when the item is already in the target root — but
+that episode is transcoded in place on the cold SMR disk instead of on the ingest pool, which
+breaks the "only ever write the finished file to SMR" rule.
+
+**The fix is to run the pipeline before the import rather than after it**, so that the *arr
+import *is* the single SMR write:
+
+1. qBittorrent "Run external program on torrent finished" posts `%I` (hash), `%F` (path) and
+   `%L` (category) to a new endpoint.
+2. The service hardlinks the media out of `/complete` into a hot work folder — the torrent keeps
+   seeding, untouched.
+3. Existing pipeline, unchanged: extract English subtitles, hand to Tdarr, verify AV1 with no
+   embedded subtitles, translate to Swedish.
+4. The service then asks *arr to import that folder:
+   `DownloadedEpisodesScan` / `DownloadedMoviesScan` with `path`, `downloadClientId` (the torrent
+   hash) and `importMode: "Move"`. Verified present in current Sonarr and Radarr, both carrying a
+   "used by third-party apps, do not modify" comment on exactly those three properties.
+5. The existing `/api/import` webhook becomes the completion signal instead of the trigger — the
+   On Import payload carries `downloadId`, so jobs close deterministically rather than by polling.
+
+Series then stay permanently rooted in the cold library, and episode 2 behaves exactly like
+episode 1. This deletes the `rootFolderPath` mutation, the `MoveSeries`/`MoveMovie` commands and
+the whole move-verification path.
+
+Required configuration changes when this lands:
+- qBittorrent: the on-completion hook above.
+- Sonarr/Radarr: **turn off Completed Download Handling (Import)**, or they will import the
+  untranscoded file the moment the torrent finishes and the race is back.
+
+Tradeoff: this service becomes the importer. If it is down nothing imports until it returns —
+recoverable, since jobs persist in SQLite and the torrent stays in qBittorrent, and a manual
+import in the *arr UI always works (by then the file is already final).
+
+Open detail: a season-pack torrent holds several episodes, so a job becomes per-media-file with a
+shared download id, and the import fires once every file in the torrent is ready.
