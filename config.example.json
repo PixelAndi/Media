@@ -1,0 +1,38 @@
+{
+  "db_file": "/opt/ai-translator/state.db",
+  "work_dir": "/opt/ai-translator/work",
+
+  "tdarr_staging_root": "/arr-ingest/.tdarr-queue",
+  "media_roots": ["/arr-ingest", "/library"],
+  "path_map": {},
+
+  "tv_target_root": "/library/tv",
+  "movie_target_root": "/library/movies",
+  "anime_tv_target_root": "/library/anime/tv",
+  "anime_marker": "/anime/",
+
+  "listen_host": "0.0.0.0",
+  "listen_port": 5000,
+
+  "poll_interval_seconds": 10,
+  "stability_checks": 2,
+  "transcode_timeout_hours": 12,
+  "move_timeout_minutes": 180,
+  "command_timeout_minutes": 30,
+  "move_without_subtitles": true,
+
+  "arr_request_timeout": 30,
+  "ffmpeg_timeout": 900,
+  "max_pipeline_attempts": 5,
+
+  "translation": {
+    "model": "gemini-2.5-flash",
+    "batch_size": 50,
+    "context_lines": 30,
+    "request_timeout": 120,
+    "delay_between_batches": 6.5,
+    "max_batch_attempts": 3,
+    "max_attempts": 3,
+    "max_untranslated_ratio": 0.1
+  }
+}

@@ -1,0 +1,19 @@
+[Unit]
+Description=AI subtitle translator and Tdarr gate
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/opt/ai-translator/venv/bin/python /opt/ai-translator/ai_translator.py
+WorkingDirectory=/opt/ai-translator
+Environment=AI_TRANSLATOR_HOME=/opt/ai-translator
+Restart=on-failure
+RestartSec=15
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+
+[Install]
+WantedBy=multi-user.target
