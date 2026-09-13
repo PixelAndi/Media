@@ -5,9 +5,80 @@ photo of a screen and may be slightly wrong.
 
 Batch 1: 16 screenshots (Tdarr, Bazarr, Jellyseerr, Prowlarr).
 Batch 2: 16 screenshots (Radarr, Sonarr).
-Batch 3 pending — **full analysis is deliberately deferred until all batches are in.**
+Batch 3: 15 screenshots (Sonarr Connect/Download Clients, TrueNAS, Proxmox, qBittorrent,
+NPMplus, Jellyfin).
+
+**Full analysis is deliberately deferred until the remaining gaps are filled.**
 
 No API keys or passwords are recorded here, even where they were legible in a screenshot.
+
+## Physical and virtual layout
+
+**Proxmox VE 9.2.2**, single node `vault-node`, 32 GiB host RAM.
+
+- **VM 100 "Vault"** — TrueNAS Community Edition. 16.00 GiB RAM (`balloon=0`), 8 cores (host),
+  OVMF/q35, VirtIO SCSI single. IP `192.168.50.45`. At the time of capture: **memory usage
+  100.57 % (16.09 GiB of 16.00 GiB)**, CPU 1.65 %, uptime 3 days.
+  - `hostpci0 0000:03:00, pcie=1, x-vga=1` — passthrough GPU (the Arc A310)
+  - scsi0 `local-lvm` 32 G — boot
+  - scsi1 `local-lvm` 150 G, ssd=1 — **nvme-apps**
+  - scsi2 `ata-Samsung_SSD_850_EVO_500GB` — **fast-pool**
+  - scsi3 `ata-TOSHIBA_MN10ADA800S` 8 TB — **Andi** mirror leg 1
+  - scsi4 `ata-TOSHIBA_MN10ADA800S` 8 TB — **Andi** mirror leg 2
+  - scsi5 `ata-ST8000DM004-2U9188` 8 TB, ssd=1 — **Media** (this is the SMR drive)
+  - scsi6 `local-lvm` 1000 G, ssd=1, backup=0 — **nvme-seed**
+  - Disks are passed through individually by `/dev/disk/by-id` as SCSI devices, not via an HBA.
+- **CT 101 "ai-translator"** — LXC. **512 MiB RAM, 512 MiB swap, 4 cores, 8 G root disk**
+  (`local-lvm:vm-101-disk-0`). **No mount points are listed on its Resources tab**, i.e. no
+  bind-mounted media. This is the host answering on `192.168.50.160:5000`.
+
+## ZFS pools (TrueNAS)
+
+| Pool | Topology | Usable | Used | Free | Notes |
+|---|---|---|---|---|---|
+| Andi | 1× MIRROR, 2 wide | 7.14 TiB | 5.54 TiB | 1.6 TiB | 77.5 % — Toshiba CMR pair |
+| Media | 1× DISK | 7.14 TiB | 706 GiB | 6.45 TiB | 9.7 % — **single SMR disk, no redundancy** |
+| fast-pool | 1× DISK | 445.75 GiB | 3.32 GiB | 442.43 GiB | 0.7 % — app configs |
+| nvme-apps | 1× DISK | 143.99 GiB | 18.39 GiB | 125.6 GiB | 12.8 % |
+| nvme-seed | 1× DISK | 961.25 GiB | 882.2 GiB | **79.05 GiB** | **91.8 % — Low Capacity warning** |
+
+**Dataset highlights**
+- `Andi/Media/Library` — the **old** library: Anime 804 GiB, Movies 485 GiB, TV 1 TiB.
+  Also `Andi/Media/Downloads` 1.55 TiB, `Andi/Audio_Library` ~1 TiB,
+  `Andi/Personal_Archive` 712 GiB, Immich/Nextcloud/PiGallery2 datasets.
+- `Media/library` — the **new** cold library: `anime`, `movies`, `tv`, `dont_media`.
+  The `tv` child reads as essentially empty (KiB-scale) **(verify)**, so most content still
+  lives in the old `Andi` library.
+- `nvme-seed` holds `arr-ingest`, `tdarr-cache` and `torrents/{complete,incomplete}` —
+  the ingest pool, the transcode cache and the torrent store all share this 91.8 %-full disk.
+- `fast-pool` holds per-app config datasets: bazarr, jellyfin (cache/config/download/transcodes),
+  jellyseerr, qbittorrent (config/incomplete), radarr, sonarr, seerr, Tdarr (transcode_storage),
+  unpackerr, Immich, PiGallery2, Nextcloud.
+
+## SMB shares (service RUNNING)
+
+| Share | Host path |
+|---|---|
+| arr-ingest | `/mnt/nvme-seed/arr-ingest` |
+| complete | `/mnt/nvme-seed/torrents/complete` |
+| incomplete | `/mnt/nvme-seed/torrents/incomplete` |
+| library | `/mnt/Media/library` |
+| old_library | `/mnt/Andi/Media/Library` |
+| downloads | `/mnt/Andi/Media/Downloads` |
+| audio_library | `/mnt/Andi/Audio_Library` |
+| personal_archive | `/mnt/Andi/Personal_Archive` |
+| jellyfin | `/mnt/fast-pool/jellyfin` |
+| qbittorrent | `/mnt/fast-pool/qbittorrent` |
+| tdarr | `/mnt/fast-pool/Tdarr` |
+
+## Reverse proxy (NPMplus, `192.168.50.45:30360`)
+
+| Source | Destination | TLS | Access |
+|---|---|---|---|
+| `request.pandi.se` | `http://192.168.50.45:5055` (Jellyseerr) | Certbot | Publicly Accessible |
+| `watch.pandi.se` | `http://192.168.50.45:30013` (Jellyfin) | Certbot | Publicly Accessible |
+
+No access lists are applied to either host.
 
 ## Hosts and ports
 
@@ -30,12 +101,17 @@ TrueNAS at `.45`, while the translator lives at `.160`.
 Each container sees these datasets under a different prefix. This is the single most important
 thing to get right for anything new that touches files.
 
-| Dataset | Sonarr / Radarr | Bazarr | Tdarr | qBittorrent |
-|---|---|---|---|---|
-| Torrent downloads | `/nvme/torrents/complete/` | — | — | `/complete/` |
-| Hot ingest (NVMe) | `/nvme/arr-ingest/...` | *not mapped* | `/ingest` **(verify)** | — |
-| Cold library (SMR) | `/library/...` | `/Media/library/...` | — | — |
-| Transcode cache | — | — | `/tdarr-cache` **(verify)** | — |
+| Dataset | Host (TrueNAS) | Sonarr / Radarr | Bazarr | Tdarr | qBittorrent |
+|---|---|---|---|---|---|
+| Torrent downloads | `/mnt/nvme-seed/torrents/complete` | `/nvme/torrents/complete/` | — | — | `/complete` |
+| Torrent incomplete | `/mnt/nvme-seed/torrents/incomplete` | — | — | — | `/incomplete` |
+| Hot ingest (NVMe) | `/mnt/nvme-seed/arr-ingest` | `/nvme/arr-ingest/...` | *not mapped* | `/ingest` **(verify)** | — |
+| Cold library (SMR) | `/mnt/Media/library` | `/library/...` | `/Media/library/...` | — | — |
+| Transcode cache | `/mnt/nvme-seed/tdarr-cache` | — | — | `/tdarr-cache` **(verify)** | — |
+
+Because `arr-ingest` and `torrents/complete` are both on **nvme-seed**, the *arr hardlink
+import works. The cold library is on the separate **Media** pool, so the final move is a
+cross-pool copy — one write to the SMR disk.
 
 **Sonarr root folders** (all four registered): `/library/anime/tv`, `/library/tv`,
 `/nvme/arr-ingest/anime/tv`, `/nvme/arr-ingest/tv`
@@ -122,6 +198,23 @@ Upscaled, WEB Tier 01–02, x265 (HD).
 **Indexers** (all via Prowlarr) — Bangumi Moe, LimeTorrents, nekoBT, Nyaa.si, SubsPlease,
 The Pirate Bay, TorrentDownload. **RSS Sync Interval 15 minutes.** Minimum Age 0, Retention 0,
 Maximum Size 0.
+
+**Download client** — qBittorrent at `192.168.50.45:8080`, enabled, no SSL, no URL base.
+- **Category `tv-sonarr`**, Post-Import Category empty
+- Recent/Older Priority: Last · Initial State: Started · Content Layout: Default
+- Sequential Order ✗ · First and Last First ✗ · Client Priority 1 · no tags
+- **Remove Completed ✓** (removes imported downloads from the client's history)
+- **Completed Download Handling: Enabled** · Redownload Failed ✓ ·
+  Redownload Failed from Interactive Search ✓
+- **Remote Path Mapping:** host `192.168.50.45`, `/complete/` → `/nvme/torrents/complete/`
+
+**Connect** — one webhook, **"AI WORM Gatekeeper"**, same as Radarr's:
+- URL `http://192.168.50.160:5000/api/import`, POST, header `X-Api-Key: <redacted>`, no tags
+- Card badge shows **On File Import**. In the edit dialog every trigger checkbox reads as
+  unticked in the photo, including On File Import — **(verify)**; the available triggers are
+  On Grab, On File Import, On File Upgrade, **On Import Complete**, On Rename, On Series Add,
+  On Series Delete, On Episode File Delete, On Health Issue, On Health Restored,
+  On Application Update, On Manual Interaction Required.
 
 ## Radarr (v6.4.3.10646, `develop` branch)
 
@@ -214,6 +307,59 @@ subtitle download ON for both.
 
 **System** — Python 3.14.6, SQLite 3.53.2, config at `/config`, uptime 1d12h,
 **Time Zone America/Los_Angeles**.
+
+## qBittorrent
+
+Deployed as a TrueNAS custom app, routed through a VPN container:
+
+```yaml
+qbit-gluetun:                      # qmcgaw/gluetun:latest
+  cap_add: [NET_ADMIN]             # devices: /dev/net/tun
+  VPN_SERVICE_PROVIDER=custom      # VPN_TYPE=wireguard
+  VPN_ENDPOINT_IP=181.214.253.166  # VPN_ENDPOINT_PORT=1337
+  WIREGUARD_ADDRESSES=10.160.213.4/32
+  DNS_UPSTREAM_PLAIN_ADDRESSES=1.1.1.1:53
+  FIREWALL_OUTBOUND_SUBNETS=192.168.50.0/24
+  ports: ['8080:8080', '6881:6881', '6881:6881/udp']
+qbittorrent:                       # lscr.io/linuxserver/qbittorrent:latest
+  network_mode: service:qbit-gluetun
+  PUID=1000  PGID=1000  WEBUI_PORT=8080
+  volumes:
+    - /mnt/fast-pool/qbittorrent/config:/config
+    - /mnt/nvme-seed/torrents/complete:/complete
+    - /mnt/nvme-seed/torrents/incomplete:/incomplete
+```
+
+WireGuard keys were redacted in the screenshot. Both images are pinned to `:latest`.
+**qBittorrent has no mount for `arr-ingest`** — only the *arr apps see both sides of the hardlink.
+
+**Downloads tab**
+- Torrent content layout: Original · Add to top of queue ✗ · Do not start automatically ✗ ·
+  Stop condition: None · Merge trackers ✗ · Delete .torrent afterwards ✗
+- Pre-allocate disk space ✗ · **Append `.!qB` to incomplete files ✓** · `.unwanted` folder ✗
+- Default Torrent Management Mode: **Manual** · When category changed: Relocate torrent ·
+  When default/category save path changed: Switch affected torrents to Manual Mode ·
+  **Use Category paths in Manual Mode ✗**
+- **Default Save Path `/complete`** · Keep incomplete torrents in `/incomplete` ✓
+- (The "Run external program on torrent finished" section sits below the captured area —
+  not yet known.)
+
+**BitTorrent tab**
+- DHT ✓ · PeX ✓ · Local Peer Discovery ✓ · Encryption: Allow encryption · Anonymous mode ✗
+- Max active checking torrents: 1 · **Torrent Queueing ✗** (limits 5/100/200 inactive)
+- Do not count slow torrents ✓ (50 KiB/s up and down, 60 s inactivity)
+- **Seeding limits: ratio ✓ 2 · total seeding time ✓ 30240 min (21 days) ·
+  inactive seeding time ✗ 1440 min → then Remove torrent and its files**
+- Automatically append trackers ✗
+
+## Jellyfin (v12.0, server "pandi")
+
+- Libraries page shows **"Shows"**; other libraries were outside the captured area.
+  Bazarr is configured against movie libraries "Movies" + "Anime Movies" and series libraries
+  "Shows" + "Anime Shows", so at least four are expected. **(verify)**
+- Plugins installed: File Transformation, Intro Skipper, JS Injector, Playback Reporting,
+  **KefinTweaks v0.4.11**
+- Config/cache/transcodes live on `fast-pool/jellyfin`; exposed publicly as `watch.pandi.se`
 
 ## Jellyseerr (`request.pandi.se`)
 
@@ -308,22 +454,32 @@ Batch-2 items worth revisiting are listed at the end, without recommendations.
 - An **ASS** custom format exists in both apps.
 - Neither app has any Release Profile configured.
 
-## Open questions
+## Batch-3 items to revisit (no recommendations yet)
 
-- **Tdarr "Media (Duplicate)" library** — what is its source path and plugin stack? If it
-  points at the same folder, files may be processed twice.
-- Does **Sonarr** have an equivalent of Radarr's `AI WORM Gatekeeper` webhook? Only Radarr's
-  Connect page has been captured.
-- Does qBittorrent currently have any on-completion hook configured, and what are its categories?
-- Which service actually answers on `192.168.50.160:5000` today, and does it serve `/translate`,
-  `/api/import`, or both?
-- Is `/ingest` in Tdarr the same dataset as `/nvme/arr-ingest`?
-- Sonarr's Download Clients page (Completed Download Handling, remote path mappings) has not
-  been captured.
+- **`nvme-seed` is 91.8 % full — 79 GiB free**, and it carries ingest + transcode cache +
+  torrents simultaneously.
+- The **Media pool is a single ST8000DM004**: an SMR disk with no redundancy, holding the
+  cold library.
+- The **TrueNAS VM reports 100.57 % memory** (16.09 GiB of 16.00 GiB, balloon disabled) on a
+  32 GiB host.
+- **CT 101 (ai-translator) has no media mount points**, 512 MiB RAM and an 8 G root disk —
+  it is on the Proxmox host, not inside the storage VM.
+- Sonarr's webhook is identical to Radarr's, pointing at `/api/import` on the translator.
+  Sonarr additionally offers an **On Import Complete** trigger that Radarr does not.
+- Both *arr apps have **Remove Completed** enabled on the qBittorrent client.
+- qBittorrent's seeding rule **removes the torrent and its files** at ratio 2 or 21 days.
+- Torrent Queueing is disabled, so all torrents run concurrently.
+- Both public hostnames are **Publicly Accessible with no access list**.
+- Most content still sits in the **old** `Andi/Media/Library`, not the new `Media/library`.
 
-## To be filled from batch 3
+## Still missing
 
-- qBittorrent (categories, paths, completion hook, seeding rules)
-- Sonarr: Download Clients, Connect
-- Jellyfin libraries and subtitle settings
-- Anything else sent
+- **Tdarr:** the "Media (Duplicate)" library's source path and plugin stack; the app's volume
+  mappings (to confirm what `/ingest` and the cache path point at on the host).
+- **qBittorrent:** the bottom of the Downloads tab (**"Run external program on torrent
+  finished"**) and the **Categories** list with their save paths.
+- **CT 101:** whether it mounts any media at all (fstab / SMB mounts inside the container), and
+  what service is actually running in it today.
+- **Jellyfin:** the full library list with each library's folder path, plus subtitle settings.
+- **TrueNAS Apps:** the volume mappings for Sonarr, Radarr and Bazarr, to finish verifying the
+  path table.
