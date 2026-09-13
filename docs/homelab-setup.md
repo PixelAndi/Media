@@ -7,6 +7,8 @@ Batch 1: 16 screenshots (Tdarr, Bazarr, Jellyseerr, Prowlarr).
 Batch 2: 16 screenshots (Radarr, Sonarr).
 Batch 3: 15 screenshots (Sonarr Connect/Download Clients, TrueNAS, Proxmox, qBittorrent,
 NPMplus, Jellyfin).
+Batch 4: 15 screenshots (CT 101 internals, qBittorrent external-program tab, TrueNAS app
+storage mappings for Tdarr/Sonarr/Radarr/Bazarr, Jellyfin libraries).
 
 **Full analysis is deliberately deferred until the remaining gaps are filled.**
 
@@ -28,9 +30,21 @@ No API keys or passwords are recorded here, even where they were legible in a sc
   - scsi5 `ata-ST8000DM004-2U9188` 8 TB, ssd=1 — **Media** (this is the SMR drive)
   - scsi6 `local-lvm` 1000 G, ssd=1, backup=0 — **nvme-seed**
   - Disks are passed through individually by `/dev/disk/by-id` as SCSI devices, not via an HBA.
-- **CT 101 "ai-translator"** — LXC. **512 MiB RAM, 512 MiB swap, 4 cores, 8 G root disk**
-  (`local-lvm:vm-101-disk-0`). **No mount points are listed on its Resources tab**, i.e. no
-  bind-mounted media. This is the host answering on `192.168.50.160:5000`.
+- **CT 101 "ai-translator"** — LXC, Debian, amd64, answering on `192.168.50.160:5000`.
+  - **512 MiB RAM, 512 MiB swap, 4 cores, 8 G root disk** (`local-lvm:vm-101-disk-0`)
+  - **Start at boot: No** · Start/Shutdown order: any · Protection: No
+  - **Unprivileged container: Yes** · Features: `nesting=1` · Entrypoint `/sbin/init`
+  - **No mount points on Resources, and `cat /etc/fstab` returns
+    "# UNCONFIGURED FSTAB FOR BASE SYSTEM"** — confirmed: the container has **no media
+    filesystems mounted at all**.
+  - `df -h`: `/` is 7.8 G with 5.8 G free (22 % used); everything else is tmpfs/udev.
+  - `systemctl status`: **State: degraded, Failed: 1 units**, up since 2026-09-10 21:08 UTC.
+  - Running: **`ai-gatekeeper.service` → `/usr/bin/python3 /opt/ai-translator/ai_gatekeeper.py`**
+    (the pre-rewrite script — the console shows `check_convergence`, `execute_worm_move`,
+    `time.sleep(5)` and the `Move{Series|Movie}` command). Also cron, dbus, ssh, postfix,
+    systemd-networkd, dhclient on eth0.
+
+Proxmox itself is reachable at `192.168.50.251:8006`.
 
 ## ZFS pools (TrueNAS)
 
@@ -113,6 +127,38 @@ Because `arr-ingest` and `torrents/complete` are both on **nvme-seed**, the *arr
 import works. The cold library is on the separate **Media** pool, so the final move is a
 cross-pool copy — one write to the SMR disk.
 
+### Confirmed container volume mappings (TrueNAS → Apps → Storage)
+
+| App | Mount path in container | Host path | Read-only |
+|---|---|---|---|
+| Sonarr | `/library` | `/mnt/Media/library` | no |
+| Sonarr | `/complete` | `/mnt/nvme-seed/torrents/complete` | no |
+| Sonarr | `/nvme` | `/mnt/nvme-seed` | no |
+| Sonarr | config | `/mnt/fast-pool/sonarr/config` | — |
+| Radarr | `/library` | `/mnt/Media/library` | no |
+| Radarr | `/complete` | `/mnt/nvme-seed/torrents/complete` | no |
+| Radarr | `/nvme` | `/mnt/nvme-seed` | no |
+| Radarr | config | `/mnt/fast-pool/radarr/config` | — |
+| Bazarr | `/Media/library` | `/mnt/Media/library` | no |
+| Bazarr | config | `/mnt/fast-pool/bazarr/config` | — |
+| Tdarr | `/ingest` | `/mnt/nvme-seed/arr-ingest` | no |
+| Tdarr | `/complete` | `/mnt/nvme-seed/torrents/complete` | **yes** |
+| Tdarr | `/tdarr-cache` | `/mnt/nvme-seed/tdarr-cache` | no |
+| Tdarr | `/Library` | `/mnt/Andi/Media/Library` (the **old** library) | no |
+| Tdarr | `/dont_media` | `/mnt/Media/library/dont_media` | no |
+| Tdarr | transcode storage | `/mnt/nvme-seed/tdarr-cache` | — |
+| ai-translator (CT 101) | *(none)* | — | — |
+
+Sonarr and Radarr mount the whole `nvme-seed` pool at `/nvme`, which is why they address
+ingest as `/nvme/arr-ingest/...` and the torrent store as `/nvme/torrents/complete` — both
+under one mount, so hardlinks span them correctly.
+
+**Bazarr mounts only the cold library.** It has no mount and no path mapping for
+`/nvme/arr-ingest/...`, which is exactly what its three health errors report.
+
+**Resource limits:** Tdarr 2 CPUs / 4096 MB with non-NVIDIA GPU passthrough enabled;
+Bazarr 4 CPUs / 8192 MB.
+
 **Sonarr root folders** (all four registered): `/library/anime/tv`, `/library/tv`,
 `/nvme/arr-ingest/anime/tv`, `/nvme/arr-ingest/tv`
 
@@ -122,10 +168,11 @@ cross-pool copy — one write to the SMR disk.
 New content is added to the `/nvme/arr-ingest/...` roots (per Jellyseerr's server config); the
 `/library/...` roots are the cold destinations.
 
-Bazarr's configured path mappings are `/Media/library/tv/` → `/Media/library/tv/` and the
-equivalents for anime/movies — i.e. the *source* side is written in Bazarr's own namespace
-rather than Sonarr's (`/library/tv/`), and there is no mapping at all for
-`/nvme/arr-ingest/...`. Bazarr's health page reports all three ingest roots as inaccessible.
+Bazarr has path mappings for the cold library only. Both columns read as `/Media/library/...`
+in the photo, but since its health check passes for the `/library/...` roots and fails only for
+the ingest roots, the left column is most likely `/library/...` → `/Media/library/...` and
+correct **(verify)**. What is certain: **there is no mapping and no mount for
+`/nvme/arr-ingest/...`**, and Bazarr reports all three ingest roots as inaccessible.
 
 ## Tdarr — library "Media"
 
@@ -341,8 +388,11 @@ WireGuard keys were redacted in the screenshot. Both images are pinned to `:late
   When default/category save path changed: Switch affected torrents to Manual Mode ·
   **Use Category paths in Manual Mode ✗**
 - **Default Save Path `/complete`** · Keep incomplete torrents in `/incomplete` ✓
-- (The "Run external program on torrent finished" section sits below the captured area —
-  not yet known.)
+- **Run external program: both boxes unticked and empty** — no "Run on torrent added" and
+  **no "Run on torrent finished" hook exists today**. Available parameters include
+  `%I` (info hash v1), `%F` (content path), `%R` (root path), `%D` (save path), `%L` (category),
+  `%N` (name), `%C` (file count), `%Z` (size).
+- Email notification section has Authentication ticked but username/password blank.
 
 **BitTorrent tab**
 - DHT ✓ · PeX ✓ · Local Peer Discovery ✓ · Encryption: Allow encryption · Anonymous mode ✗
@@ -354,9 +404,21 @@ WireGuard keys were redacted in the screenshot. Both images are pinned to `:late
 
 ## Jellyfin (v12.0, server "pandi")
 
-- Libraries page shows **"Shows"**; other libraries were outside the captured area.
-  Bazarr is configured against movie libraries "Movies" + "Anime Movies" and series libraries
-  "Shows" + "Anime Shows", so at least four are expected. **(verify)**
+Four libraries, all pointing at the **new** cold library — the old `Andi/Media/Library` is not
+a Jellyfin library:
+
+| Library | Folder | Preferred download language | Metadata downloaders |
+|---|---|---|---|
+| Shows | `/library/tv` | English | Kitsu/AniList/AniDB all unticked |
+| Movies | `/library/movies` | English | TheTVDB ✓, TheMovieDb ✓, AniList/AniDB ✗ |
+| Anime Shows | `/library/anime/tv` | *(empty)* | AniDB ✓, AniList ✓ … |
+| Anime Movies | `/library/anime/movies` | *(empty)* | AniDB ✓, AniList ✓, TheTVDB ✓, TheMovieDb ✓ |
+
+Common to all four: **Enable the library ✓**, **Enable real time monitoring ✓**,
+**"Disable different types of embedded subtitles" = Allow All**, Prefer embedded titles ✗,
+Prefer embedded episode information ✗, Special series display name "Specials",
+Automatically add to collection ✗ (movie libraries).
+
 - Plugins installed: File Transformation, Intro Skipper, JS Injector, Playback Reporting,
   **KefinTweaks v0.4.11**
 - Config/cache/transcodes live on `fast-pool/jellyfin`; exposed publicly as `watch.pandi.se`
@@ -472,14 +534,28 @@ Batch-2 items worth revisiting are listed at the end, without recommendations.
 - Both public hostnames are **Publicly Accessible with no access list**.
 - Most content still sits in the **old** `Andi/Media/Library`, not the new `Media/library`.
 
+## Batch-4 items to revisit (no recommendations yet)
+
+- **The translator container has no media mounts** (`fstab` unconfigured, `df` shows only the
+  root disk and tmpfs). The deployed `ai_gatekeeper.py` addresses files by absolute path, so
+  every path-based operation in it — `os.stat`, `ffprobe`, the move verification — is
+  operating on paths that do not exist inside that container.
+- **CT 101 has "Start at boot" set to No**, so a Proxmox reboot leaves the translator down.
+- **`systemctl` reports the container as degraded with 1 failed unit** (which unit is not shown).
+- The container is **unprivileged**, which constrains how media could be mounted into it.
+- **qBittorrent has no torrent-completion hook configured** — neither "on added" nor
+  "on finished".
+- **Tdarr also mounts the old library** (`/Library` → `/mnt/Andi/Media/Library`) and has
+  `/complete` mounted **read-only**.
+- Tdarr is limited to **2 CPUs / 4 GB**; Bazarr to 4 CPUs / 8 GB.
+- Jellyfin's four libraries all point at the **new** cold library, and all four have
+  **real time monitoring on** and embedded subtitles set to **Allow All**.
+
 ## Still missing
 
-- **Tdarr:** the "Media (Duplicate)" library's source path and plugin stack; the app's volume
-  mappings (to confirm what `/ingest` and the cache path point at on the host).
-- **qBittorrent:** the bottom of the Downloads tab (**"Run external program on torrent
-  finished"**) and the **Categories** list with their save paths.
-- **CT 101:** whether it mounts any media at all (fstab / SMB mounts inside the container), and
-  what service is actually running in it today.
-- **Jellyfin:** the full library list with each library's folder path, plus subtitle settings.
-- **TrueNAS Apps:** the volume mappings for Sonarr, Radarr and Bazarr, to finish verifying the
-  path table.
+- **Tdarr:** the "Media (Duplicate)" library's source path and plugin stack — the only real
+  gap left. If it points at the same folder, files may be processed twice.
+- **CT 101:** which unit is failing (`systemctl --failed`).
+- Minor: qBittorrent's **Categories** list and their save paths. With Default TMM on Manual,
+  "Use Category paths in Manual Mode" off and a default save path of `/complete`, this is
+  unlikely to change any conclusion.
