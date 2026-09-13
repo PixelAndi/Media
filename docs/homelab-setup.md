@@ -551,10 +551,13 @@ Batch-2 items worth revisiting are listed at the end, without recommendations.
 - Jellyfin's four libraries all point at the **new** cold library, and all four have
   **real time monitoring on** and embedded subtitles set to **Allow All**.
 
+## Answered
+
+- **Tdarr "Media (Duplicate)"** was a one-off job to move (and transcode) media from the old
+  mirrored-CMR pool to the new SMR pool. It has been halted. `architecture.md` §7 replaces it.
+
 ## Still missing
 
-- **Tdarr:** the "Media (Duplicate)" library's source path and plugin stack — the only real
-  gap left. If it points at the same folder, files may be processed twice.
 - **CT 101:** which unit is failing (`systemctl --failed`).
 - Minor: qBittorrent's **Categories** list and their save paths. With Default TMM on Manual,
   "Use Category paths in Manual Mode" off and a default save path of `/complete`, this is
