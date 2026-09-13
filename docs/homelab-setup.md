@@ -3,8 +3,11 @@
 Reconstructed from screenshots of the live setup. Values marked **(verify)** were read off a
 photo of a screen and may be slightly wrong.
 
-Batch 1: 16 screenshots (Tdarr, Bazarr, Jellyseerr, Prowlarr). More to come — this file is
-appended as they arrive.
+Batch 1: 16 screenshots (Tdarr, Bazarr, Jellyseerr, Prowlarr).
+Batch 2: 16 screenshots (Radarr, Sonarr).
+Batch 3 pending — **full analysis is deliberately deferred until all batches are in.**
+
+No API keys or passwords are recorded here, even where they were legible in a screenshot.
 
 ## Hosts and ports
 
@@ -24,20 +27,29 @@ TrueNAS at `.45`, while the translator lives at `.160`.
 
 ## Storage layout
 
-Hot pool (NVMe), as Sonarr/Radarr see it:
-- `/nvme/arr-ingest/tv` — Sonarr root folder
-- `/nvme/arr-ingest/anime/tv` — Sonarr anime root folder
-- `/nvme/arr-ingest/movies` — Radarr root folder
+Each container sees these datasets under a different prefix. This is the single most important
+thing to get right for anything new that touches files.
 
-Cold pool (SMR), as Bazarr sees it:
-- `/Media/library/tv/`, `/Media/library/anime/tv/`
-- `/Media/library/movies/`, `/Media/library/anime/movies/`
+| Dataset | Sonarr / Radarr | Bazarr | Tdarr | qBittorrent |
+|---|---|---|---|---|
+| Torrent downloads | `/nvme/torrents/complete/` | — | — | `/complete/` |
+| Hot ingest (NVMe) | `/nvme/arr-ingest/...` | *not mapped* | `/ingest` **(verify)** | — |
+| Cold library (SMR) | `/library/...` | `/Media/library/...` | — | — |
+| Transcode cache | — | — | `/tdarr-cache` **(verify)** | — |
 
-Tdarr sees its source as `/ingest` **(verify)** and its transcode cache as `/tdarr-cache`
-**(verify)** — container paths, presumably bound to the same NVMe dataset.
+**Sonarr root folders** (all four registered): `/library/anime/tv`, `/library/tv`,
+`/nvme/arr-ingest/anime/tv`, `/nvme/arr-ingest/tv`
 
-Note the path namespaces differ per container (`/nvme/arr-ingest/...` vs `/Media/library/...`
-vs `/ingest`). Anything new that touches these paths needs an explicit mapping.
+**Radarr root folders** (all four registered): `/library/anime/movies`, `/library/movies`,
+`/nvme/arr-ingest/anime/movies`, `/nvme/arr-ingest/movies`
+
+New content is added to the `/nvme/arr-ingest/...` roots (per Jellyseerr's server config); the
+`/library/...` roots are the cold destinations.
+
+Bazarr's configured path mappings are `/Media/library/tv/` → `/Media/library/tv/` and the
+equivalents for anime/movies — i.e. the *source* side is written in Bazarr's own namespace
+rather than Sonarr's (`/library/tv/`), and there is no mapping at all for
+`/nvme/arr-ingest/...`. Bazarr's health page reports all three ingest roots as inaccessible.
 
 ## Tdarr — library "Media"
 
@@ -78,6 +90,86 @@ original file.**
 8. **Boosh-Transcode Using QSV GPU & FFMPEG** (AV1 on the Arc A310)
 9. lmg1 Reorder Streams
 10. New File Size Check
+
+## Sonarr (v4.0.20.3012)
+
+**Media Management**
+- Rename Episodes ✓ · Replace Illegal Characters ✓ · Colon Replacement: Smart Replace
+- Standard/Daily format: `{Series TitleYear} - S{season:00}E{episode:00} - {Episode CleanTitle} [{Quality Full}][{Custom Formats}][{MediaInfo VideoD…`
+- Anime format: same with `- {absolute:000} -` inserted after the episode number
+- Series folder: `{Series CleanTitleWithoutYear} ({Series Year}) [tvdbid-{TvdbId}]` ·
+  Season folder: `Season {season}` · Specials folder: `Specials` · Multi-episode: Prefixed Range
+- Create/Delete empty series folders: both ✗
+- Episode Title Required: Only for Bulk Season Releases · Minimum Free Space 100 MB
+- **Use Hardlinks instead of Copy ✓** · Import Using Script ✗
+- **Import Extra Files ✓ — `srt,ass`**
+- Unmonitor Deleted Episodes ✗ · Propers and Repacks: Prefer and Upgrade ·
+  Analyse video files ✓ · **Rescan Series Folder after Refresh: Always** · Change File Date: None
+- Recycling Bin: empty (cleanup 7 days) · Set Permissions ✗ (chmod 755 / umask 0022)
+
+**Profiles** — Any - 1080p/SD, Any Anime - 1080p/SD, HD - 1080p, HD Anime - 1080p, UHD - 4K,
+UHD Anime - 4K. Delay profile: Prefer Usenet, no delay on either protocol. No release profiles.
+
+**Quality definitions** — Preferred is 95 on every row. Max: 100 (SD/480/576), 125 (HDTV 720/1080),
+130 (WEB/Bluray 720–1080), 155 (Bluray-1080p), 1000 (Raw-HD, all Remux and 2160p rows),
+199.9 (Unknown, HDTV-2160p). Min: 2–4 for HD rows, 35 for Remux/2160p.
+
+**Custom Formats** — TRaSH-style set: 2.0 Stereo, Anime - English Dub, Anime BD Tier 01–08,
+Anime Dual Audio, Anime LQ Groups, Anime Raws, Anime Web Tier 01–06, Asian LQ, Asian Tier 01–03,
+**ASS**, Dubs Only, Executable / Malware, HD Bluray Tier 01, MULTi, Remux Tier 01–02, Uncensored,
+Upscaled, WEB Tier 01–02, x265 (HD).
+
+**Indexers** (all via Prowlarr) — Bangumi Moe, LimeTorrents, nekoBT, Nyaa.si, SubsPlease,
+The Pirate Bay, TorrentDownload. **RSS Sync Interval 15 minutes.** Minimum Age 0, Retention 0,
+Maximum Size 0.
+
+## Radarr (v6.4.3.10646, `develop` branch)
+
+**Media Management**
+- Rename Movies ✓ · Replace Illegal Characters ✓ · Colon Replacement: Smart Replace
+- Standard format: `{Movie CleanTitle} ({Release Year}) [imdbid-{ImdbId}] - {edition-{Edition Tags}} [{Quality Full}][{Custom Formats}][{Media…`
+- Movie folder: `{Movie CleanTitle} ({Release Year}) [imdbid-{ImdbId}]`
+- Radarr shows a deprecation warning: movie-file property tokens will stop being supported in a
+  future major version
+- Create/Delete empty movie folders: both ✗ · Minimum Free Space 100 MB
+- **Use Hardlinks instead of Copy ✓** · Import Using Script ✗
+- **Import Extra Files ✓ — `srt,ass`**
+- Unmonitor Deleted Movies ✗ · Propers and Repacks: Prefer and Upgrade · Analyze video files ✓ ·
+  **Rescan Movie Folder after Refresh: Always** · Change File Date: None
+- Recycling Bin: empty (cleanup 7 days) · Set Permissions ✗ (chmod 755 / umask 0022)
+
+**Profiles** — same six profiles as Sonarr. Delay profile: Prefer Usenet, no delay. No release
+profiles.
+
+**Quality definitions** — Preferred 95 / Max 100 for everything up to Bluray-1080p;
+Preferred 1999 / Max 2000 with unlimited size sliders for Remux-1080p, all 2160p rows, BR-DISK
+and Raw-HD.
+
+**Custom Formats** — same TRaSH-style set as Sonarr plus HD Bluray Tier 01–03, Remux Tier 01–03,
+UHD Bluray Tier 01–03, LQ, WEB Tier 01–03.
+
+**Indexers** (all via Prowlarr) — Bangumi Moe, nekoBT, Nyaa.si, The Pirate Bay, TorrentDownload.
+**RSS Sync Interval 30 minutes.** Prefer Indexer Flags ✗ · Availability Delay 0 ·
+Whitelisted Subtitle Tags empty · **Allow Hardcoded Subs ✗**
+
+**Download client** — qBittorrent, enabled.
+- **Completed Download Handling: Enabled** ("Automatically import completed downloads from
+  download client"), check interval 1 minute
+- Failed Download Handling: Redownload Failed ✓, Redownload Failed from Interactive Search ✓
+- **Remote Path Mapping:** host `192.168.50.45`, remote `/complete/` → local `/nvme/torrents/complete/`
+
+**Connect** — one webhook connection, **"AI WORM Gatekeeper"**:
+- Trigger: **On File Import only** (On Grab, On File Upgrade, On Rename, On Movie Added,
+  On Movie Delete, On Movie File Delete, health/update/manual-interaction triggers all unchecked)
+- URL `http://192.168.50.160:5000/api/import`, method POST, no basic auth
+- Header `X-Api-Key: <redacted>`
+- No tag filter
+
+**General** — bind `*`, port 30025, no URL base, no allowed-hosts restriction, instance name
+"Radarr", no application URL, SSL off. Authentication: Forms (login page), required Enabled,
+username `andi`. Certificate validation Enabled, no trusted networks, no proxy.
+**Log Level: Debug**, log size limit 1 MB. Anonymous usage data off.
+Updates: branch **develop**, automatic off, mechanism Docker. Backups every 7 days, retention 28.
 
 ## Bazarr
 
@@ -142,6 +234,9 @@ Blocklisted Torrent Hashes While Grabbing" unchecked.
 
 # Findings
 
+**Status: batch-1 observations only. The consolidated review is on hold until batch 3 arrives.**
+Batch-2 items worth revisiting are listed at the end, without recommendations.
+
 ## Confirmed working / correctly set
 
 - Bazarr writes sidecars alongside the media file, and **Remove Tags is off**, so subtitle
@@ -193,17 +288,42 @@ Blocklisted Torrent Hashes While Grabbing" unchecked.
    *and* a custom post-processing hook calls the AI translator. Whichever is authoritative,
    the other is at best wasted work.
 
+## Batch-2 items to revisit (no recommendations yet)
+
+- Radarr's `AI WORM Gatekeeper` webhook fires on **On File Import only** — On File Upgrade is
+  not selected.
+- **Completed Download Handling is enabled** in Radarr with a 1-minute check interval. This is
+  the setting the pre-import restructure would need to change.
+- Both Sonarr and Radarr have **Import Extra Files ✓ with `srt,ass`** — the prerequisite for
+  sidecars travelling with the media was already in place.
+- Both use **hardlinks instead of copy**, and **Rescan after Refresh: Always**.
+- Radarr sees the cold library as `/library/...` while Bazarr's mappings are written against
+  `/Media/library/...`; there is no mapping for `/nvme/arr-ingest/...` in Bazarr at all.
+- Delay profiles in both apps say **Prefer Usenet**, but every configured indexer is a torrent
+  tracker.
+- Radarr tracks the **`develop`** branch (hence v6.x) and runs at **Debug** log level with a
+  1 MB log cap.
+- Radarr's quality definitions allow up to 2000 MB/min on Remux/2160p rows; Sonarr's cap the
+  same tiers at 1000.
+- An **ASS** custom format exists in both apps.
+- Neither app has any Release Profile configured.
+
 ## Open questions
 
 - **Tdarr "Media (Duplicate)" library** — what is its source path and plugin stack? If it
   points at the same folder, files may be processed twice.
-- Does qBittorrent currently have any on-completion hook configured?
-- Which service actually answers on `192.168.50.160:5000` today?
+- Does **Sonarr** have an equivalent of Radarr's `AI WORM Gatekeeper` webhook? Only Radarr's
+  Connect page has been captured.
+- Does qBittorrent currently have any on-completion hook configured, and what are its categories?
+- Which service actually answers on `192.168.50.160:5000` today, and does it serve `/translate`,
+  `/api/import`, or both?
 - Is `/ingest` in Tdarr the same dataset as `/nvme/arr-ingest`?
+- Sonarr's Download Clients page (Completed Download Handling, remote path mappings) has not
+  been captured.
 
-## To be filled from the next batch
+## To be filled from batch 3
 
-- qBittorrent (categories, paths, completion hook)
-- Sonarr/Radarr: Media Management, Import Extra Files, Completed Download Handling
+- qBittorrent (categories, paths, completion hook, seeding rules)
+- Sonarr: Download Clients, Connect
 - Jellyfin libraries and subtitle settings
 - Anything else sent
