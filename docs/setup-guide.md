@@ -440,8 +440,9 @@ Leave everything else. The `/data/...` paths are already correct.
 
 ### 4. Create the app
 
-Apps → **Discover Apps → Custom App** → give it the name `gatekeeper` → choose the YAML /
-custom config option, and paste:
+Apps → **Discover Apps** → use the **Install via YAML / custom config** option (not the
+Custom App *form* — that form cannot express the `command:` line below). Name it `gatekeeper`
+and paste this exactly:
 
 ```yaml
 services:
@@ -462,6 +463,12 @@ services:
                 pip install --no-cache-dir -r /config/requirements.txt &&
                 exec setpriv --reuid=568 --regid=568 --clear-groups python /config/ai_translator.py"
 ```
+
+**`image:` must stay `python:3.12-slim`.** It is tempting to put a GitHub URL there, but Docker
+does not clone repositories — it would fail with `invalid reference format`. The image is just a
+minimal Linux with Python in it. Your code reaches the container through the *volume*:
+`/mnt/fast-pool/gatekeeper` appears inside as `/config`, and the last line runs
+`/config/ai_translator.py` from there. Nothing points at GitHub once the files are downloaded.
 
 **Note what the last line does.** The container starts as root, because installing packages needs
 root. `setpriv` then drops to user 568 before starting the service, so the Python process — and
@@ -609,7 +616,9 @@ resume whenever you like.
 | Torrents show "Missing files" after Phase 1 | Right-click → Force recheck. The data did not move. |
 | Want to undo Phase 1 entirely | `zfs rename nvme-seed/data nvme-seed/torrents/complete` — instant, then restore the old volume paths. |
 | Want to undo everything in Phase 1–2 | `zfs rollback nvme-seed@before-overhaul` and restore the config file you downloaded. |
-| Gatekeeper will not start | `docker logs --tail 50 gatekeeper` — it names the exact problem. |
+| Gatekeeper will not start | `docker logs --tail 50 gatekeeper`, and `tail -20 /var/log/app_lifecycle.log` if no container was even created. |
+| `invalid reference format: repository name must be lowercase` | A URL went into `image:`. It must be `python:3.12-slim`; the code comes from the volume mount, not from GitHub. |
+| Container exits immediately after `apt-get` | The container must start as root. Do not add `user:` to the compose — `setpriv` in the command drops privileges instead. |
 | Jobs stick at `transcoding` | Tdarr is not seeing `/data/transcode`, or is not stripping subtitles. Check the Tdarr queue. |
 | Jobs fail with "did not import" | Sonarr/Radarr rejected the release. The files are still in `/data/work/<id>/` — import them by hand from Sonarr → Wanted → Manual Import. |
 | A subtitle came out untranslated | Normal for a few lines — the gatekeeper keeps the English text rather than lose the styling. |
