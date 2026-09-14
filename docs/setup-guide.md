@@ -562,19 +562,70 @@ Leave **Remove Tags off** so subtitle styling survives.
 
 ### 5. Live test
 
-Pick something small — a single episode of an ongoing show — and request it in Jellyseerr.
+This is the slowest step in the guide, and most of it is waiting. Nothing here is broken just
+because the screen is empty — read step 5c before you worry.
 
-Watch it move:
+**5a. Check the gatekeeper is awake.** No key needed for this one:
 
 ```sh
-watch -n 5 'curl -s -H "X-Api-Key: YOUR_SECRET" http://192.168.50.45:5000/api/jobs | head -c 2000'
+curl -s http://192.168.50.45:5000/health; echo
 ```
 
-The `state` field walks through `new` → `transcoding` → `transcoded` → `importing` → `done`.
-`Ctrl+C` to stop watching. If anything fails, `error_detail` says why in plain language.
+You want `{"status":"ok","jobs":{}}`. The empty `{}` is correct — it means no jobs yet.
 
-What you should see at the end: the episode in Jellyfin, in AV1, with a Swedish subtitle track,
+**5b. Request one episode in Jellyseerr.** A single episode of an ongoing show, not a season pack.
+
+**5c. Watch the download first — not the gatekeeper.** The gatekeeper does nothing at all until
+the download reaches 100%. Until then it is *supposed* to look idle. Open **qBittorrent's Web UI**
+and find your episode:
+
+| What you see | What it means |
+|---|---|
+| Downloading, progress climbing | Working. Wait for 100%. |
+| Stalled at 0% for several minutes | No seeders — that release is dead. Pick a different one in Jellyseerr. |
+| Not in the list at all | Sonarr never sent it. Go to **Sonarr → Activity → Queue**, then **History**. No "Grabbed" entry means Sonarr found no release — an indexer matter, nothing to do with the gatekeeper. |
+
+Do not move on until you have seen it hit 100%.
+
+**5d. Now watch the gatekeeper.** Run this, press up-arrow and Enter to repeat it every minute or
+so:
+
+```sh
+curl -s -H "X-Api-Key: YOUR_SECRET" http://192.168.50.45:5000/api/jobs; echo
+```
+
+`[]` means no jobs yet. Within about 5 seconds of the download finishing, a job should appear. The
+`state` field then walks through `new` → `transcoding` → `transcoded` → `importing` → `done`.
+Transcoding is the long part — tens of minutes for one episode is normal.
+
+To watch it happen live instead, leave this running and it prints each step as it goes
+(`Ctrl+C` to stop watching — that stops the watching, not the pipeline):
+
+```sh
+docker logs -f gatekeeper
+```
+
+If anything fails, `error_detail` in the job says why in plain language.
+
+**What you should see at the end:** the episode in Jellyfin, in AV1, with a Swedish subtitle track,
 and the original still seeding in qBittorrent.
+
+**5e. If the download finished but no job appeared.** Wait 5 more minutes first. The gatekeeper
+polls qBittorrent by itself every 5 minutes and picks up anything the completion hook missed, so a
+finished download gets caught either way — worst case slowly. If it is still `[]` after that:
+
+```sh
+docker logs --tail 30 gatekeeper
+```
+
+- `reconcile failed: ...` → it cannot reach qBittorrent. Check the URL and login in your secrets file.
+- Nothing since startup → check the torrent's **category** in qBittorrent. It must be `tv-sonarr`
+  or `radarr`; the gatekeeper ignores everything else on purpose.
+
+**One gotcha that will confuse you:** the gatekeeper's log prints UTC, which is 7 hours ahead of
+your local time in summer. A log line stamped `19:14` happened at `12:14` your time. When comparing
+a log line against a download that finished "an hour ago", convert first — otherwise it looks like
+the gatekeeper ignored something it never actually saw.
 
 ---
 
