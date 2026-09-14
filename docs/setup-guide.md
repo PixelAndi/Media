@@ -290,7 +290,31 @@ Start qBittorrent. **Check that your critical torrents still show as Seeding, no
 If any show "Missing files", right-click → Force recheck — the data is there, it just needs to
 look again.
 
-### 7. Fix the SMB shares that pointed at the old paths
+### 7. Repoint the other apps' `/complete` mount
+
+Sonarr, Radarr and Tdarr will **refuse to start** until you do this, with
+`bind source path does not exist: /mnt/nvme-seed/torrents/complete` in
+`/var/log/app_lifecycle.log`. That is expected - their config still points at the old
+location.
+
+For each of **Sonarr**, **Radarr** and **Tdarr**: Apps -> Edit -> Storage -> find the entry
+whose container path is `/complete` and change only its **host path**:
+
+| | |
+|---|---|
+| old | `/mnt/nvme-seed/torrents/complete` |
+| new | `/mnt/nvme-seed/data/torrents/complete` |
+
+Leave the container path as `/complete`, and leave every other mount alone for now. Save,
+and they start.
+
+Then in **Sonarr and Radarr -> Settings -> Download Clients -> Remote Path Mappings**,
+delete the entry (`/complete/` to `/nvme/torrents/complete/`). It pointed at the old
+location through the `/nvme` mount; now that qBittorrent and the *arr apps both call the
+folder `/complete`, the paths match on their own and that mapping would send imports
+somewhere that no longer exists.
+
+### 8. Fix the SMB shares that pointed at the old paths
 
 Shares → SMB: edit `complete` to `/mnt/nvme-seed/data/torrents/complete`. Delete the
 `arr-ingest` share; that dataset is going away.
@@ -309,7 +333,12 @@ For each app: **Apps → the app → Edit → Storage**.
 | Remove | Add |
 |---|---|
 | `/complete` | `/data` → `/mnt/nvme-seed/data` |
-| `/nvme` | (keep `/library` → `/mnt/Media/library`) |
+| `/nvme` - **only after Phase 0.5 drains `arr-ingest`** | (keep `/library` → `/mnt/Media/library`) |
+
+**Do not remove `/nvme` while `arr-ingest` still holds content.** Sonarr and Radarr reach
+those files through that mount; remove it early and every show and movie stored there goes
+missing in their libraries. If Phase 0.5 is not finished, add `/data` now and leave `/nvme`
+and `/complete` where they are.
 
 Leave the User ID and Group ID alone — they are already 568, which is what everything else now matches.
 
