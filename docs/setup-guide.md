@@ -449,7 +449,6 @@ services:
     image: python:3.12-slim
     container_name: gatekeeper
     restart: unless-stopped
-    user: "568:568"
     ports:
       - "5000:5000"
     environment:
@@ -458,10 +457,17 @@ services:
       - /mnt/fast-pool/gatekeeper:/config
       - /mnt/nvme-seed/data:/data
     command: >
-      bash -lc "apt-get update && apt-get install -y --no-install-recommends ffmpeg &&
+      bash -lc "apt-get update &&
+                apt-get install -y --no-install-recommends ffmpeg &&
                 pip install --no-cache-dir -r /config/requirements.txt &&
-                python /config/ai_translator.py"
+                exec setpriv --reuid=568 --regid=568 --clear-groups python /config/ai_translator.py"
 ```
+
+**Note what the last line does.** The container starts as root, because installing packages needs
+root. `setpriv` then drops to user 568 before starting the service, so the Python process — and
+every file and hardlink it creates — belongs to the same user as Sonarr and Radarr. Setting
+`user: "568:568"` on the container instead would look tidier and fail immediately: a non-root user
+cannot run `apt-get`.
 
 The container installs ffmpeg and its libraries on every start, so give it two or three minutes
 before you expect it to answer.
