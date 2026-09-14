@@ -1,16 +1,23 @@
 #!/usr/bin/env python3
-"""Subtitle translation gate between Sonarr/Radarr imports and Tdarr transcoding.
+"""Gatekeeper between qBittorrent and the *arr import.
 
-Pipeline per imported file:
-  import webhook -> wait for stable file -> extract English subtitles
-  -> hand the file to Tdarr (hardlink into Tdarr's watch folder)
-  -> translate subtitles to Swedish while Tdarr transcodes
-  -> verify Tdarr output (AV1, no embedded subtitles) -> swap it back into the
-     ingest folder next to the .sv sidecar -> rescan in *arr -> move to the
-     cold library root -> verify.
+Nothing reaches the library pool until it is final. Per torrent:
 
-Subtitles are extracted before Tdarr ever sees the file, so the embedded
-English track cannot be stripped out from under us.
+  qBittorrent finishes -> hardlink media into /data/work/<job>/   (seed untouched)
+                       -> extract the English subtitle track
+                       -> hand the video to Tdarr via /data/transcode/<job>/<n>/
+                       -> translate EN -> SV while Tdarr encodes
+                       -> verify Tdarr's output (AV1, no subtitles, duration matches)
+                       -> move it back beside its .sv sidecar
+                       -> DownloadedEpisodesScan / DownloadedMoviesScan with importMode=Move
+
+That *arr import is the single write to the library pool.
+
+Tdarr cannot see a file until its subtitles have been extracted, so the embedded
+English track can never be stripped out from under us.
+
+A reconcile loop polls qBittorrent for completed torrents the database does not
+know about, so a missed webhook or a restart costs nothing.
 """
 
 from __future__ import annotations
@@ -25,6 +32,7 @@ import re
 import shutil
 import sqlite3
 import subprocess
+import tempfile
 import threading
 import time
 from contextlib import contextmanager
@@ -34,9 +42,9 @@ from typing import Any, Iterator
 import pysubs2
 import requests
 import uvicorn
-from fastapi import Body, Depends, FastAPI, Header, HTTPException
+from fastapi import Body, Depends, FastAPI, File, Header, HTTPException, Response, UploadFile
 
-log = logging.getLogger("ai-translator")
+log = logging.getLogger("gatekeeper")
 
 BASE_DIR = Path(os.environ.get("AI_TRANSLATOR_HOME", "/opt/ai-translator"))
 SECRETS_FILE = Path(os.environ.get("AI_TRANSLATOR_SECRETS", BASE_DIR / "secrets.json"))
@@ -44,25 +52,29 @@ CONFIG_FILE = Path(os.environ.get("AI_TRANSLATOR_CONFIG", BASE_DIR / "config.jso
 
 DEFAULTS: dict[str, Any] = {
     "db_file": str(BASE_DIR / "state.db"),
-    "work_dir": str(BASE_DIR / "work"),
-    "tdarr_staging_root": "/tdarr-ingest",
-    "media_roots": ["/arr-ingest", "/library"],
-    "path_map": {},
-    "tv_target_root": "/library/tv",
-    "movie_target_root": "/library/movies",
-    "anime_tv_target_root": "/library/anime/tv",
-    "anime_marker": "/anime/",
+    "data_root": "/data",
+    "complete_root": "/data/torrents/complete",
+    "work_root": "/data/work",
+    "transcode_root": "/data/transcode",
+    "download_categories": {"tv-sonarr": "series", "radarr": "movie"},
+    "min_media_bytes": 50_000_000,
+    "sample_markers": ["sample", "trailer"],
     "listen_host": "0.0.0.0",
     "listen_port": 5000,
     "poll_interval_seconds": 10,
     "stability_checks": 2,
     "transcode_timeout_hours": 12,
-    "move_timeout_minutes": 180,
+    "import_timeout_minutes": 60,
     "command_timeout_minutes": 30,
-    "move_without_subtitles": True,
+    "import_without_subtitles": True,
     "arr_request_timeout": 30,
     "ffmpeg_timeout": 900,
     "max_pipeline_attempts": 5,
+    "qbittorrent": {
+        "url": "",
+        "reconcile_interval_seconds": 300,
+        "reconcile_max_age_hours": 24,
+    },
     "translation": {
         "model": "gemini-2.5-flash",
         "batch_size": 50,
@@ -76,26 +88,27 @@ DEFAULTS: dict[str, Any] = {
 }
 
 MEDIA_EXTENSIONS = {".mkv", ".mp4", ".m4v", ".avi", ".mov", ".ts", ".webm"}
+SUBTITLE_EXTENSIONS = {".srt", ".ass", ".ssa", ".vtt"}
 TEXT_SUBTITLE_CODECS = {"ass": ".ass", "ssa": ".ass", "subrip": ".srt", "text": ".srt", "mov_text": ".srt"}
 IMAGE_SUBTITLE_CODECS = {"hdmv_pgs_subtitle", "dvd_subtitle", "dvb_subtitle", "xsub"}
 ENGLISH_TAGS = {"eng", "en", "en-us", "en-gb", "english"}
-ACCEPTED_EVENT_TYPES = {"Download", "Import", "EpisodeFileImported", "MovieFileImported"}
 
-# Tdarr writes its work-in-progress under these names inside the library folder.
-TDARR_TEMP_MARKERS = ("tdarrcachefile", "-tdarr-", ".partial", ".tmp")
+# Tdarr's work-in-progress files inside the folder it is watching.
+TDARR_TEMP_MARKERS = ("tdarrcachefile", "-tdarr-", ".partial", ".tmp", ".workdir")
 
 STATE_NEW = "new"
-STATE_STAGED = "staged"
+STATE_TRANSCODING = "transcoding"
 STATE_TRANSCODED = "transcoded"
-STATE_RESCAN_PENDING = "rescan_pending"
-STATE_MOVE_PENDING = "move_pending"
+STATE_IMPORTING = "importing"
 STATE_DONE = "done"
 STATE_FAILED = "failed"
-ACTIVE_STATES = (STATE_NEW, STATE_STAGED, STATE_TRANSCODED, STATE_RESCAN_PENDING, STATE_MOVE_PENDING)
+PER_FILE_STATES = (STATE_NEW, STATE_TRANSCODING)
 
 TR_PENDING, TR_PROCESSING, TR_DONE, TR_FAILED = "pending", "processing", "done", "failed"
 
 shutdown = threading.Event()
+# One translation at a time, whether it came from the pipeline or from Bazarr.
+translation_lock = threading.Lock()
 
 
 class PipelineError(Exception):
@@ -131,9 +144,12 @@ def load_settings() -> tuple[dict[str, Any], dict[str, Any]]:
 
 CONFIG, SECRETS = load_settings()
 DB_FILE = CONFIG["db_file"]
-WORK_DIR = Path(CONFIG["work_dir"])
-STAGING_ROOT = Path(CONFIG["tdarr_staging_root"])
-MEDIA_ROOTS = [Path(root) for root in CONFIG["media_roots"]]
+DATA_ROOT = Path(CONFIG["data_root"])
+COMPLETE_ROOT = Path(CONFIG["complete_root"])
+WORK_ROOT = Path(CONFIG["work_root"])
+TRANSCODE_ROOT = Path(CONFIG["transcode_root"])
+# Temporary subtitles live outside work/ so they can never be swept up by an import.
+SCRATCH_ROOT = DATA_ROOT / ".scratch"
 GEMINI_URL = (
     f"https://generativelanguage.googleapis.com/v1beta/models/"
     f"{CONFIG['translation']['model']}:generateContent"
@@ -144,11 +160,14 @@ GEMINI_URL = (
 
 COLUMNS: dict[str, str] = {
     "id": "INTEGER PRIMARY KEY AUTOINCREMENT",
-    "source_path": "TEXT NOT NULL UNIQUE",
-    "current_path": "TEXT NOT NULL",
+    "download_id": "TEXT NOT NULL",
+    "download_name": "TEXT",
+    "category": "TEXT",
     "media_type": "TEXT NOT NULL CHECK(media_type IN ('series','movie'))",
-    "item_id": "INTEGER NOT NULL",
-    "target_root": "TEXT NOT NULL",
+    "source_path": "TEXT NOT NULL UNIQUE",
+    "work_dir": "TEXT",
+    "work_path": "TEXT",
+    "transcode_dir": "TEXT",
     "state": "TEXT NOT NULL DEFAULT 'new'",
     "translation_state": "TEXT NOT NULL DEFAULT 'pending'",
     "translation_attempts": "INTEGER NOT NULL DEFAULT 0",
@@ -157,13 +176,13 @@ COLUMNS: dict[str, str] = {
     "en_subtitle_path": "TEXT",
     "sv_subtitle_path": "TEXT",
     "untranslated_lines": "INTEGER NOT NULL DEFAULT 0",
-    "staging_dir": "TEXT",
-    "staged_at": "REAL",
     "source_duration": "REAL",
     "last_size": "INTEGER",
     "stable_checks": "INTEGER NOT NULL DEFAULT 0",
-    "arr_command_id": "INTEGER",
-    "move_deadline": "REAL",
+    "staged_at": "REAL",
+    "import_command_id": "INTEGER",
+    "import_deadline": "REAL",
+    "imported_path": "TEXT",
     "error_detail": "TEXT",
     "created_at": "REAL NOT NULL DEFAULT 0",
     "updated_at": "REAL NOT NULL DEFAULT 0",
@@ -192,8 +211,8 @@ def init_db() -> None:
     with db() as conn:
         conn.execute("PRAGMA journal_mode=WAL")
         existing = {row["name"] for row in conn.execute("PRAGMA table_info(jobs)")}
-        if existing and "source_path" not in existing:
-            log.warning("found a pre-rewrite jobs table, renaming it to jobs_legacy")
+        if existing and "download_id" not in existing:
+            log.warning("found a jobs table from an earlier design, renaming it to jobs_legacy")
             conn.execute("DROP TABLE IF EXISTS jobs_legacy")
             conn.execute("ALTER TABLE jobs RENAME TO jobs_legacy")
             existing = set()
@@ -201,18 +220,15 @@ def init_db() -> None:
         for name, ddl in COLUMNS.items():
             if existing and name not in existing:
                 conn.execute(f"ALTER TABLE jobs ADD COLUMN {name} {ddl}")
+        conn.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_state ON jobs(state)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_download ON jobs(download_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_translation ON jobs(translation_state)")
 
 
 def fetch_jobs(query: str, params: tuple = ()) -> list[sqlite3.Row]:
     with db() as conn:
         return conn.execute(query, params).fetchall()
-
-
-def get_job(job_id: int) -> sqlite3.Row | None:
-    with db() as conn:
-        return conn.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
 
 
 def update_job(job_id: int, **fields: Any) -> None:
@@ -225,32 +241,74 @@ def update_job(job_id: int, **fields: Any) -> None:
         conn.execute(f"UPDATE jobs SET {assignments} WHERE id=?", (*fields.values(), job_id))
 
 
+def update_download(download_id: str, **fields: Any) -> None:
+    unknown = set(fields) - UPDATABLE_COLUMNS
+    if unknown:
+        raise ValueError(f"unknown job columns: {sorted(unknown)}")
+    fields["updated_at"] = time.time()
+    assignments = ", ".join(f"{name}=?" for name in fields)
+    with db() as conn:
+        conn.execute(
+            f"UPDATE jobs SET {assignments} WHERE download_id=? AND state NOT IN (?,?)",
+            (*fields.values(), download_id, STATE_DONE, STATE_FAILED),
+        )
+
+
 def fail_job(job_id: int, detail: str) -> None:
     log.error("job %s failed: %s", job_id, detail)
     update_job(job_id, state=STATE_FAILED, error_detail=detail[:1000])
 
 
-def job_key(source_path: str) -> str:
-    return hashlib.sha1(source_path.encode()).hexdigest()[:16]
+def fail_download(download_id: str, detail: str) -> None:
+    log.error("download %s failed: %s", download_id, detail)
+    update_download(download_id, state=STATE_FAILED, error_detail=detail[:1000])
+
+
+def meta_get(key: str) -> str | None:
+    with db() as conn:
+        row = conn.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+    return row["value"] if row else None
+
+
+def meta_set(key: str, value: str) -> None:
+    with db() as conn:
+        conn.execute("INSERT INTO meta (key, value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                     (key, value))
+
+
+def job_key(download_id: str) -> str:
+    return hashlib.sha1(download_id.encode()).hexdigest()[:16]
 
 
 # --------------------------------------------------------------------------- paths
 
 
-def map_path(raw: str) -> str:
-    for source, destination in CONFIG["path_map"].items():
-        if raw == source or raw.startswith(source.rstrip("/") + "/"):
-            return destination.rstrip("/") + raw[len(source.rstrip("/")):]
-    return raw
-
-
-def within_media_roots(path: Path) -> bool:
+def within_data_root(path: Path) -> bool:
     resolved = Path(os.path.normpath(str(path)))
-    return any(resolved == root or root in resolved.parents for root in MEDIA_ROOTS)
+    return resolved == DATA_ROOT or DATA_ROOT in resolved.parents
 
 
 def sidecar_path(media: Path, ext: str) -> Path:
     return media.with_name(f"{media.stem}.sv{ext}")
+
+
+def find_media_files(content: Path) -> list[Path]:
+    """Media files worth processing inside a finished torrent."""
+    if content.is_file():
+        candidates = [content]
+    else:
+        candidates = sorted(p for p in content.rglob("*") if p.is_file())
+    markers = [m.lower() for m in CONFIG["sample_markers"]]
+    keep = []
+    for path in candidates:
+        if path.suffix.lower() not in MEDIA_EXTENSIONS:
+            continue
+        if any(marker in path.name.lower() for marker in markers):
+            continue
+        if path.stat().st_size < CONFIG["min_media_bytes"]:
+            continue
+        keep.append(path)
+    return keep
 
 
 # --------------------------------------------------------------------------- ffprobe / ffmpeg
@@ -292,8 +350,6 @@ def pick_english_subtitle(info: dict[str, Any]) -> dict[str, Any] | None:
         if language not in ENGLISH_TAGS and not (not language and "english" in title):
             continue
         codec = stream.get("codec_name", "")
-        if codec in IMAGE_SUBTITLE_CODECS:
-            continue
         if codec not in TEXT_SUBTITLE_CODECS:
             continue
         forced = bool(stream.get("disposition", {}).get("forced")) or "forced" in title
@@ -444,7 +500,7 @@ def translate_subtitle_file(source: Path, destination: Path) -> int:
     return untranslated
 
 
-# --------------------------------------------------------------------------- *arr client
+# --------------------------------------------------------------------------- service clients
 
 
 class ArrClient:
@@ -453,9 +509,7 @@ class ArrClient:
         self.base_url = SECRETS[f"{prefix}_URL"].rstrip("/")
         self.headers = {"X-Api-Key": SECRETS[f"{prefix}_API_KEY"]}
         self.media_type = media_type
-        self.item_endpoint = "series" if media_type == "series" else "movie"
-        self.file_endpoint = "episodefile" if media_type == "series" else "moviefile"
-        self.id_field = "seriesId" if media_type == "series" else "movieId"
+        self.scan_command = "DownloadedEpisodesScan" if media_type == "series" else "DownloadedMoviesScan"
 
     def _request(self, method: str, endpoint: str, **kwargs: Any) -> Any:
         response = requests.request(
@@ -468,39 +522,108 @@ class ArrClient:
         response.raise_for_status()
         return response.json() if response.content else {}
 
-    def get_item(self, item_id: int) -> dict[str, Any]:
-        return self._request("GET", f"{self.item_endpoint}/{item_id}")
-
-    def get_file(self, file_id: int) -> dict[str, Any]:
-        return self._request("GET", f"{self.file_endpoint}/{file_id}")
-
-    def list_files(self, item_id: int) -> list[dict[str, Any]]:
-        files = self._request("GET", f"{self.file_endpoint}?{self.id_field}={item_id}")
-        return files if isinstance(files, list) else [files]
-
-    def rescan(self, item_id: int) -> int:
-        name = "RescanSeries" if self.media_type == "series" else "RescanMovie"
-        return int(self._request("POST", "command", json={"name": name, self.id_field: item_id})["id"])
+    def request_import(self, path: Path, download_id: str) -> int:
+        """Ask *arr to import a finished folder. This is the single library write."""
+        body = {
+            "name": self.scan_command,
+            "path": str(path),
+            "downloadClientId": download_id.upper(),
+            "importMode": "Move",
+        }
+        return int(self._request("POST", "command", json=body)["id"])
 
     def command_status(self, command_id: int) -> dict[str, Any]:
         return self._request("GET", f"command/{command_id}")
 
-    def move_to_root(self, item: dict[str, Any], target_root: str) -> None:
-        folder = os.path.basename(str(item.get("path", "")).rstrip("/"))
-        if not folder:
-            raise PipelineError("could not determine the item folder name")
-        item["rootFolderPath"] = target_root
-        item["path"] = os.path.join(target_root, folder)
-        self._request("PUT", f"{self.item_endpoint}/{item['id']}?moveFiles=true", json=item)
+
+class QbitClient:
+    """Read-only client used to find completions the webhook missed."""
+
+    def __init__(self) -> None:
+        self.base_url = str(CONFIG["qbittorrent"]["url"]).rstrip("/")
+        self.session = requests.Session()
+        self.authenticated = False
+
+    def _login(self) -> None:
+        username = SECRETS.get("QBIT_USERNAME")
+        password = SECRETS.get("QBIT_PASSWORD")
+        if not username:
+            self.authenticated = True  # WebUI auth bypassed for this client
+            return
+        response = self.session.post(
+            f"{self.base_url}/api/v2/auth/login",
+            data={"username": username, "password": password or ""},
+            headers={"Referer": self.base_url},
+            timeout=CONFIG["arr_request_timeout"],
+        )
+        response.raise_for_status()
+        if response.text.strip() != "Ok.":
+            raise PipelineError("qBittorrent rejected the login")
+        self.authenticated = True
+
+    def completed_torrents(self) -> list[dict[str, Any]]:
+        if not self.authenticated:
+            self._login()
+        response = self.session.get(
+            f"{self.base_url}/api/v2/torrents/info",
+            params={"filter": "completed"},
+            timeout=CONFIG["arr_request_timeout"],
+        )
+        if response.status_code == 403:
+            self.authenticated = False
+            raise PipelineError("qBittorrent session expired")
+        response.raise_for_status()
+        return response.json()
 
 
-# --------------------------------------------------------------------------- pipeline steps
+# --------------------------------------------------------------------------- ingest
 
 
-def wait_for_stable_file(job: sqlite3.Row) -> bool:
-    path = Path(job["current_path"])
-    if not path.exists():
-        raise FatalJobError(f"source file disappeared: {path}")
+def ingest_download(download_id: str, name: str, category: str, content_path: str) -> dict[str, Any]:
+    """Create one job row per media file in a finished torrent."""
+    media_type = CONFIG["download_categories"].get(category)
+    if media_type not in ("series", "movie"):
+        return {"status": f"ignored category {category!r}"}
+
+    content = Path(content_path)
+    if not within_data_root(content):
+        raise HTTPException(status_code=400, detail=f"{content} is outside {DATA_ROOT}")
+    if not content.exists():
+        raise HTTPException(status_code=400, detail=f"{content} does not exist")
+
+    download_id = download_id.upper()
+    now = time.time()
+    media = find_media_files(content)
+
+    if not media:
+        # Recorded as failed so the reconcile loop stops offering it back.
+        rows = [(download_id, name, category, media_type, str(content), STATE_FAILED,
+                 "no media files found in this download", now, now)]
+    else:
+        rows = [(download_id, name, category, media_type, str(path), STATE_NEW, None, now, now)
+                for path in media]
+
+    with db() as conn:
+        conn.executemany(
+            """
+            INSERT OR IGNORE INTO jobs
+                (download_id, download_name, category, media_type, source_path,
+                 state, error_detail, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            rows,
+        )
+        created = conn.total_changes
+
+    log.info("accepted %s download %s (%s): %s file(s), %s new",
+             media_type, download_id[:8], name, len(media), created)
+    return {"status": "accepted", "files": len(media), "new": created}
+
+
+# --------------------------------------------------------------------------- pipeline
+
+
+def wait_for_stable_size(job: sqlite3.Row, path: Path) -> bool:
     size = path.stat().st_size
     if job["last_size"] == size:
         stable = job["stable_checks"] + 1
@@ -510,75 +633,80 @@ def wait_for_stable_file(job: sqlite3.Row) -> bool:
     return False
 
 
-def stage_for_tdarr(job: sqlite3.Row) -> Path:
-    source = Path(job["current_path"])
-    staging_dir = STAGING_ROOT / job_key(job["source_path"])
-    if staging_dir.exists():
-        shutil.rmtree(staging_dir)
-    staging_dir.mkdir(parents=True)
+def link_into_work(source: Path, work_dir: Path) -> Path:
+    work_dir.mkdir(parents=True, exist_ok=True)
+    target = work_dir / source.name
+    if target.exists():
+        if target.stat().st_ino == source.stat().st_ino:
+            return target
+        target = work_dir / f"{source.parent.name}-{source.name}"
+        if target.exists():
+            return target
     try:
-        os.link(source, staging_dir / source.name)
+        os.link(source, target)
     except OSError as exc:
-        shutil.rmtree(staging_dir, ignore_errors=True)
         if exc.errno == errno.EXDEV:
             raise FatalJobError(
-                f"{STAGING_ROOT} and {source.parent} are on different filesystems; "
-                "the Tdarr staging folder must live on the same filesystem as the ingest folder"
+                f"{work_dir} and {source.parent} are on different filesystems; "
+                "the whole /data tree must be one ZFS dataset for hardlinks to work"
             ) from exc
-        raise PipelineError(f"could not stage file for Tdarr: {exc}") from exc
-    return staging_dir
+        raise PipelineError(f"could not hardlink into the work folder: {exc}") from exc
+    return target
 
 
 def handle_new(job: sqlite3.Row) -> None:
-    if not wait_for_stable_file(job):
+    source = Path(job["source_path"])
+    if not source.exists():
+        raise FatalJobError(f"source file disappeared: {source}")
+    if not wait_for_stable_size(job, source):
         return
-    media = Path(job["current_path"])
-    info = ffprobe(media)
-    work_dir = WORK_DIR / job_key(job["source_path"])
-    work_dir.mkdir(parents=True, exist_ok=True)
 
+    key = job_key(job["download_id"])
+    work_dir = WORK_ROOT / key
+    work_path = link_into_work(source, work_dir)
+    info = ffprobe(work_path)
+    duration = probe_duration(info)
+
+    scratch = SCRATCH_ROOT / key
+    scratch.mkdir(parents=True, exist_ok=True)
     stream = pick_english_subtitle(info)
     if stream is None:
-        image_only = any(
-            s.get("codec_name") in IMAGE_SUBTITLE_CODECS for s in streams_of_type(info, "subtitle")
-        )
-        detail = (
-            "only image-based (PGS/VobSub) English subtitles found; OCR is not supported"
-            if image_only
-            else "no English subtitle track found"
-        )
+        image_only = any(s.get("codec_name") in IMAGE_SUBTITLE_CODECS
+                         for s in streams_of_type(info, "subtitle"))
+        detail = ("only image-based (PGS/VobSub) English subtitles found; OCR is not supported"
+                  if image_only else "no English subtitle track found")
         log.warning("job %s: %s", job["id"], detail)
         update_job(job["id"], translation_state=TR_FAILED, error_detail=detail)
     else:
         ext = TEXT_SUBTITLE_CODECS[stream["codec_name"]]
-        en_subtitle = work_dir / f"{media.stem}.en{ext}"
-        extract_subtitle(media, stream, en_subtitle)
-        update_job(job["id"], subtitle_ext=ext, en_subtitle_path=str(en_subtitle), translation_state=TR_PENDING)
-        log.info("job %s: extracted English subtitles to %s", job["id"], en_subtitle)
+        en_subtitle = scratch / f"{work_path.stem}.en{ext}"
+        extract_subtitle(work_path, stream, en_subtitle)
+        update_job(job["id"], subtitle_ext=ext, en_subtitle_path=str(en_subtitle),
+                   translation_state=TR_PENDING)
+        log.info("job %s: extracted English subtitles from %s", job["id"], work_path.name)
 
-    duration = probe_duration(info)
     if is_av1(info) and not streams_of_type(info, "subtitle"):
         log.info("job %s: already AV1 with no embedded subtitles, skipping Tdarr", job["id"])
-        update_job(job["id"], state=STATE_TRANSCODED, source_duration=duration)
+        update_job(job["id"], state=STATE_TRANSCODED, work_dir=str(work_dir),
+                   work_path=str(work_path), source_duration=duration,
+                   last_size=work_path.stat().st_size, stable_checks=0)
         return
 
-    staging_dir = stage_for_tdarr(job)
-    update_job(
-        job["id"],
-        state=STATE_STAGED,
-        staging_dir=str(staging_dir),
-        staged_at=time.time(),
-        source_duration=duration,
-        last_size=None,
-        stable_checks=0,
-    )
-    log.info("job %s: handed to Tdarr at %s", job["id"], staging_dir)
+    transcode_dir = TRANSCODE_ROOT / key / str(job["id"])
+    transcode_dir.mkdir(parents=True, exist_ok=True)
+    os.replace(work_path, transcode_dir / work_path.name)
+    # work_path records where the file will come back to, not where it is right now.
+    update_job(job["id"], state=STATE_TRANSCODING, work_dir=str(work_dir),
+               work_path=str(work_path), transcode_dir=str(transcode_dir),
+               source_duration=duration, staged_at=time.time(),
+               last_size=None, stable_checks=0)
+    log.info("job %s: handed %s to Tdarr", job["id"], work_path.name)
 
 
-def find_transcode_output(staging_dir: Path) -> Path | None:
-    if not staging_dir.is_dir():
+def find_transcode_output(transcode_dir: Path) -> Path | None:
+    if not transcode_dir.is_dir():
         return None
-    for candidate in sorted(staging_dir.iterdir()):
+    for candidate in sorted(transcode_dir.iterdir()):
         if not candidate.is_file() or candidate.suffix.lower() not in MEDIA_EXTENSIONS:
             continue
         if any(marker in candidate.name.lower() for marker in TDARR_TEMP_MARKERS):
@@ -587,12 +715,14 @@ def find_transcode_output(staging_dir: Path) -> Path | None:
     return None
 
 
-def handle_staged(job: sqlite3.Row) -> None:
-    staging_dir = Path(job["staging_dir"])
+def handle_transcoding(job: sqlite3.Row) -> None:
+    transcode_dir = Path(job["transcode_dir"])
     elapsed_hours = (time.time() - (job["staged_at"] or time.time())) / 3600
-    candidate = find_transcode_output(staging_dir)
+    expired = elapsed_hours > CONFIG["transcode_timeout_hours"]
+
+    candidate = find_transcode_output(transcode_dir)
     if candidate is None:
-        if elapsed_hours > CONFIG["transcode_timeout_hours"]:
+        if expired:
             raise FatalJobError("Tdarr removed the staged file without producing an output")
         return
 
@@ -606,14 +736,14 @@ def handle_staged(job: sqlite3.Row) -> None:
 
     info = ffprobe(candidate)
     if not is_av1(info):
-        if elapsed_hours > CONFIG["transcode_timeout_hours"]:
+        if expired:
             raise FatalJobError("Tdarr did not produce an AV1 file within the timeout")
         return
-    remaining_subs = streams_of_type(info, "subtitle")
-    if remaining_subs:
-        if elapsed_hours > CONFIG["transcode_timeout_hours"]:
+    remaining = streams_of_type(info, "subtitle")
+    if remaining:
+        if expired:
             raise FatalJobError(
-                f"transcoded file still has {len(remaining_subs)} embedded subtitle stream(s); "
+                f"transcoded file still has {len(remaining)} embedded subtitle stream(s); "
                 "configure Tdarr to strip subtitles"
             )
         return
@@ -622,151 +752,137 @@ def handle_staged(job: sqlite3.Row) -> None:
     if expected and duration and abs(duration - expected) / expected > 0.02:
         raise FatalJobError(f"transcoded duration {duration:.0f}s does not match source {expected:.0f}s")
 
-    log.info("job %s: Tdarr output verified (%s)", job["id"], candidate.name)
-    update_job(job["id"], state=STATE_TRANSCODED, last_size=None, stable_checks=0)
+    work_dir = Path(job["work_dir"])
+    work_dir.mkdir(parents=True, exist_ok=True)
+    final = work_dir / (Path(job["work_path"]).stem + candidate.suffix)
+    os.replace(candidate, final)
+    shutil.rmtree(transcode_dir, ignore_errors=True)
+    update_job(job["id"], state=STATE_TRANSCODED, work_path=str(final),
+               transcode_dir=None, last_size=final.stat().st_size, stable_checks=0)
+    log.info("job %s: Tdarr output verified, %s is ready to import", job["id"], final.name)
 
 
 def translation_settled(job: sqlite3.Row) -> bool:
     if job["translation_state"] == TR_DONE:
         return True
-    return job["translation_state"] == TR_FAILED and CONFIG["move_without_subtitles"]
+    return job["translation_state"] == TR_FAILED and CONFIG["import_without_subtitles"]
 
 
-def swap_in_transcoded_file(job: sqlite3.Row) -> Path:
-    """Replace the ingest file with Tdarr's output and park the .sv sidecar beside it."""
-    original = Path(job["current_path"])
-    staging_dir = Path(job["staging_dir"]) if job["staging_dir"] else None
-    transcoded = find_transcode_output(staging_dir) if staging_dir else None
-
-    final = original
-    if transcoded is not None:
-        final = original.with_suffix(transcoded.suffix)
-        os.replace(transcoded, final)
-        if final != original and original.exists():
-            original.unlink()
-    if staging_dir is not None:
-        shutil.rmtree(staging_dir, ignore_errors=True)
-
-    place_sidecar_next_to(job, final)
-    shutil.rmtree(WORK_DIR / job_key(job["source_path"]), ignore_errors=True)
-    update_job(job["id"], current_path=str(final), staging_dir=None, last_size=final.stat().st_size)
-    return final
-
-
-def handle_transcoded(job: sqlite3.Row) -> None:
-    if not translation_settled(job):
+def place_sidecar(job: sqlite3.Row) -> None:
+    """Move the Swedish subtitle out of scratch and name it after the final video."""
+    if not job["sv_subtitle_path"]:
         return
-    final = swap_in_transcoded_file(job)
-    log.info("job %s: final media file is %s", job["id"], final)
-    client = ArrClient(job["media_type"])
-    command_id = client.rescan(job["item_id"])
-    update_job(job["id"], state=STATE_RESCAN_PENDING, arr_command_id=command_id, staged_at=time.time())
-
-
-def handle_rescan_pending(job: sqlite3.Row) -> None:
-    client = ArrClient(job["media_type"])
-    status = client.command_status(job["arr_command_id"])
-    state = status.get("status")
-    if state in ("queued", "started"):
-        if time.time() - (job["staged_at"] or 0) > CONFIG["command_timeout_minutes"] * 60:
-            raise FatalJobError("*arr rescan did not finish within the timeout")
-        return
-    if state != "completed":
-        raise FatalJobError(f"*arr rescan ended with status '{state}'")
-
-    item = client.get_item(job["item_id"])
-    if os.path.normpath(str(item.get("rootFolderPath", ""))) == os.path.normpath(job["target_root"]):
-        log.info("job %s: item already in %s, no move needed", job["id"], job["target_root"])
-        finish_job(job, client, item)
-        return
-    client.move_to_root(item, job["target_root"])
-    update_job(
-        job["id"],
-        state=STATE_MOVE_PENDING,
-        arr_command_id=None,
-        move_deadline=time.time() + CONFIG["move_timeout_minutes"] * 60,
-    )
-    log.info("job %s: move to %s requested", job["id"], job["target_root"])
-
-
-def locate_moved_file(client: ArrClient, job: sqlite3.Row, item: dict[str, Any]) -> Path | None:
-    """Find our file in *arr's records after a rescan/move, tolerating renames."""
-    expected_size = job["last_size"]
-    item_path = os.path.normpath(str(item.get("path", "")))
-    best: Path | None = None
-    for record in client.list_files(job["item_id"]):
-        record_path = record.get("path")
-        if not record_path:
-            continue
-        candidate = Path(record_path)
-        if item_path and not str(candidate).startswith(item_path + os.sep):
-            continue
-        if expected_size is not None and record.get("size") == expected_size:
-            return candidate
-        if candidate.stem == Path(job["current_path"]).stem:
-            best = candidate
-    return best
-
-
-def place_sidecar_next_to(job: sqlite3.Row, media: Path) -> None:
-    current = Path(job["sv_subtitle_path"]) if job["sv_subtitle_path"] else None
-    if current is None:
-        return
+    current = Path(job["sv_subtitle_path"])
+    media = Path(job["work_path"])
     destination = sidecar_path(media, job["subtitle_ext"] or ".srt")
-    if current == destination and destination.exists():
-        return
-    if destination.exists():
-        update_job(job["id"], sv_subtitle_path=str(destination))
+    if current == destination:
         return
     if not current.exists():
         log.warning("job %s: Swedish subtitle is missing from %s", job["id"], current)
         return
-    destination.parent.mkdir(parents=True, exist_ok=True)
     shutil.move(str(current), str(destination))
     update_job(job["id"], sv_subtitle_path=str(destination))
-    log.info("job %s: placed Swedish subtitle at %s", job["id"], destination)
 
 
-def finish_job(job: sqlite3.Row, client: ArrClient, item: dict[str, Any]) -> None:
-    media = locate_moved_file(client, job, item)
-    if media is None or not media.exists():
-        raise PipelineError("*arr has not registered the media file at its destination yet")
-    place_sidecar_next_to(job, media)
-    detail = None
+def import_ready_downloads() -> None:
+    """When every file of a torrent is final, ask *arr to import the folder."""
+    rows = fetch_jobs("SELECT * FROM jobs WHERE state=? ORDER BY created_at", (STATE_TRANSCODED,))
+    by_download: dict[str, list[sqlite3.Row]] = {}
+    for row in rows:
+        by_download.setdefault(row["download_id"], []).append(row)
+
+    for download_id, jobs in by_download.items():
+        waiting = fetch_jobs(
+            "SELECT COUNT(*) AS pending FROM jobs WHERE download_id=? AND state IN (?,?)",
+            (download_id, STATE_NEW, STATE_TRANSCODING),
+        )[0]["pending"]
+        if waiting:
+            continue
+        if not all(translation_settled(job) for job in jobs):
+            continue
+
+        try:
+            for job in jobs:
+                place_sidecar(job)
+            work_dir = Path(jobs[0]["work_dir"])
+            client = ArrClient(jobs[0]["media_type"])
+            command_id = client.request_import(work_dir, download_id)
+        except Exception as exc:  # noqa: BLE001 - retried on the next tick
+            log.warning("download %s: could not request import: %s", download_id[:8], exc)
+            continue
+
+        update_download(
+            download_id,
+            state=STATE_IMPORTING,
+            import_command_id=command_id,
+            import_deadline=time.time() + CONFIG["import_timeout_minutes"] * 60,
+            staged_at=time.time(),
+        )
+        log.info("download %s: import requested for %s (%s file(s))",
+                 download_id[:8], work_dir, len(jobs))
+
+
+def cleanup_download(download_id: str) -> None:
+    key = job_key(download_id)
+    for path in (WORK_ROOT / key, TRANSCODE_ROOT / key, SCRATCH_ROOT / key):
+        shutil.rmtree(path, ignore_errors=True)
+
+
+def advance_imports() -> None:
+    rows = fetch_jobs("SELECT * FROM jobs WHERE state=?", (STATE_IMPORTING,))
+    by_download: dict[str, list[sqlite3.Row]] = {}
+    for row in rows:
+        by_download.setdefault(row["download_id"], []).append(row)
+
+    for download_id, jobs in by_download.items():
+        first = jobs[0]
+        try:
+            status = ArrClient(first["media_type"]).command_status(first["import_command_id"])
+        except Exception as exc:  # noqa: BLE001 - retried on the next tick
+            log.warning("download %s: could not read import command: %s", download_id[:8], exc)
+            continue
+
+        state = status.get("status")
+        expired = time.time() > (first["import_deadline"] or 0)
+        if state in ("queued", "started") and not expired:
+            continue
+        if state not in ("queued", "started", "completed"):
+            fail_download(download_id, f"*arr import command ended with status '{state}'")
+            continue
+
+        remaining = [job for job in jobs if Path(job["work_path"]).exists()]
+        if remaining:
+            if not expired:
+                continue
+            names = ", ".join(Path(job["work_path"]).name for job in remaining[:3])
+            fail_download(
+                download_id,
+                f"*arr did not import {len(remaining)} of {len(jobs)} file(s) ({names}); "
+                "files are left in the work folder for manual import",
+            )
+            continue
+
+        for job in jobs:
+            update_job(job["id"], state=STATE_DONE,
+                       error_detail=import_note(job))
+        cleanup_download(download_id)
+        log.info("download %s: imported and cleaned up", download_id[:8])
+
+
+def import_note(job: sqlite3.Row) -> str | None:
     if job["translation_state"] == TR_FAILED:
-        detail = f"moved without Swedish subtitles: {job['error_detail']}"
-    elif job["untranslated_lines"]:
-        detail = f"{job['untranslated_lines']} line(s) left untranslated"
-    update_job(job["id"], state=STATE_DONE, current_path=str(media), error_detail=detail)
-    log.info("job %s: complete at %s", job["id"], media)
+        return f"imported without Swedish subtitles: {job['error_detail']}"
+    if job["untranslated_lines"]:
+        return f"{job['untranslated_lines']} line(s) left untranslated"
+    return None
 
 
-def handle_move_pending(job: sqlite3.Row) -> None:
-    client = ArrClient(job["media_type"])
-    item = client.get_item(job["item_id"])
-    root = os.path.normpath(str(item.get("rootFolderPath", "")))
-    if root == os.path.normpath(job["target_root"]):
-        media = locate_moved_file(client, job, item)
-        if media is not None and media.exists():
-            finish_job(job, client, item)
-            return
-    if time.time() > (job["move_deadline"] or 0):
-        # Nothing is deleted here: both copies, if any, are left for manual inspection.
-        raise FatalJobError(f"*arr did not move the item into {job['target_root']} within the timeout")
-
-
-HANDLERS = {
-    STATE_NEW: handle_new,
-    STATE_STAGED: handle_staged,
-    STATE_TRANSCODED: handle_transcoded,
-    STATE_RESCAN_PENDING: handle_rescan_pending,
-    STATE_MOVE_PENDING: handle_move_pending,
-}
+HANDLERS = {STATE_NEW: handle_new, STATE_TRANSCODING: handle_transcoding}
 
 
 def pipeline_tick() -> None:
-    placeholders = ",".join("?" for _ in ACTIVE_STATES)
-    jobs = fetch_jobs(f"SELECT * FROM jobs WHERE state IN ({placeholders}) ORDER BY created_at", ACTIVE_STATES)
+    placeholders = ",".join("?" for _ in PER_FILE_STATES)
+    jobs = fetch_jobs(f"SELECT * FROM jobs WHERE state IN ({placeholders}) ORDER BY created_at", PER_FILE_STATES)
     for job in jobs:
         try:
             HANDLERS[job["state"]](job)
@@ -782,6 +898,9 @@ def pipeline_tick() -> None:
             else:
                 update_job(job["id"], pipeline_attempts=attempts, error_detail=str(exc)[:1000])
 
+    import_ready_downloads()
+    advance_imports()
+
 
 def pipeline_loop() -> None:
     while not shutdown.is_set():
@@ -790,6 +909,62 @@ def pipeline_loop() -> None:
         except Exception:  # noqa: BLE001 - the loop must survive
             log.exception("pipeline tick crashed")
         shutdown.wait(CONFIG["poll_interval_seconds"])
+
+
+# --------------------------------------------------------------------------- reconcile
+
+
+def reconcile_once(client: QbitClient) -> int:
+    torrents = client.completed_torrents()
+    watermark = float(meta_get("reconcile_watermark") or 0)
+    if not watermark:
+        # First run: adopt the current state instead of ingesting the whole seed list.
+        meta_set("reconcile_watermark", str(time.time()))
+        log.info("reconcile: first run, adopting %s existing completed torrent(s)", len(torrents))
+        return 0
+
+    cutoff = max(watermark, time.time() - CONFIG["qbittorrent"]["reconcile_max_age_hours"] * 3600)
+    enqueued = 0
+    for torrent in torrents:
+        category = torrent.get("category", "")
+        if category not in CONFIG["download_categories"]:
+            continue
+        if float(torrent.get("completion_on") or 0) < cutoff:
+            continue
+        download_id = str(torrent.get("hash", "")).upper()
+        if not download_id:
+            continue
+        known = fetch_jobs("SELECT 1 FROM jobs WHERE download_id=? LIMIT 1", (download_id,))
+        if known:
+            continue
+        content_path = torrent.get("content_path") or torrent.get("save_path")
+        if not content_path:
+            continue
+        log.info("reconcile: picking up missed completion %s (%s)", download_id[:8], torrent.get("name"))
+        try:
+            ingest_download(download_id, torrent.get("name", ""), category, content_path)
+        except HTTPException as exc:
+            log.warning("reconcile: skipping %s: %s", download_id[:8], exc.detail)
+            continue
+        enqueued += 1
+    return enqueued
+
+
+def reconcile_loop() -> None:
+    if not CONFIG["qbittorrent"]["url"]:
+        log.warning("qbittorrent.url is not configured; the reconcile safety net is disabled")
+        return
+    client = QbitClient()
+    interval = CONFIG["qbittorrent"]["reconcile_interval_seconds"]
+    while not shutdown.is_set():
+        try:
+            reconcile_once(client)
+        except Exception as exc:  # noqa: BLE001 - the loop must survive
+            log.warning("reconcile failed: %s", exc)
+        shutdown.wait(interval)
+
+
+# --------------------------------------------------------------------------- translation worker
 
 
 def claim_translation_job() -> sqlite3.Row | None:
@@ -810,12 +985,11 @@ def claim_translation_job() -> sqlite3.Row | None:
 
 def process_translation(job: sqlite3.Row) -> None:
     en_subtitle = Path(job["en_subtitle_path"])
-    sv_subtitle = en_subtitle.with_name(
-        en_subtitle.stem.removesuffix(".en") + ".sv" + en_subtitle.suffix
-    )
+    sv_subtitle = en_subtitle.with_name(en_subtitle.stem.removesuffix(".en") + ".sv" + en_subtitle.suffix)
     log.info("job %s: translating %s", job["id"], en_subtitle.name)
     try:
-        untranslated = translate_subtitle_file(en_subtitle, sv_subtitle)
+        with translation_lock:
+            untranslated = translate_subtitle_file(en_subtitle, sv_subtitle)
     except FatalJobError as exc:
         update_job(job["id"], translation_state=TR_FAILED, error_detail=str(exc)[:1000])
         log.error("job %s: translation failed permanently: %s", job["id"], exc)
@@ -823,22 +997,13 @@ def process_translation(job: sqlite3.Row) -> None:
     except Exception as exc:  # noqa: BLE001 - retried up to max_attempts
         attempts = job["translation_attempts"] + 1
         final = attempts >= CONFIG["translation"]["max_attempts"]
-        update_job(
-            job["id"],
-            translation_state=TR_FAILED if final else TR_PENDING,
-            translation_attempts=attempts,
-            error_detail=str(exc)[:1000],
-        )
+        update_job(job["id"], translation_state=TR_FAILED if final else TR_PENDING,
+                   translation_attempts=attempts, error_detail=str(exc)[:1000])
         log.warning("job %s: translation attempt %s failed: %s", job["id"], attempts, exc)
         return
     en_subtitle.unlink(missing_ok=True)
-    update_job(
-        job["id"],
-        translation_state=TR_DONE,
-        sv_subtitle_path=str(sv_subtitle),
-        untranslated_lines=untranslated,
-        en_subtitle_path=None,
-    )
+    update_job(job["id"], translation_state=TR_DONE, sv_subtitle_path=str(sv_subtitle),
+               untranslated_lines=untranslated, en_subtitle_path=None)
     log.info("job %s: translation done (%s untranslated lines)", job["id"], untranslated)
 
 
@@ -856,37 +1021,12 @@ def translation_loop() -> None:
 
 # --------------------------------------------------------------------------- web app
 
-app = FastAPI(title="AI Translator")
+app = FastAPI(title="Media gatekeeper")
 
 
 def require_secret(x_api_key: str = Header(default="")) -> None:
     if not hmac.compare_digest(x_api_key, SECRETS["WEBHOOK_SECRET"]):
         raise HTTPException(status_code=401, detail="Unauthorized")
-
-
-def resolve_path(payload: dict[str, Any], media_type: str) -> str:
-    file_payload = payload.get("episodeFile") or payload.get("movieFile") or {}
-    raw = file_payload.get("path")
-    if not raw or not str(raw).startswith("/"):
-        file_id = file_payload.get("id")
-        if not file_id:
-            raise HTTPException(status_code=400, detail="Payload contains no file path or file id")
-        try:
-            raw = ArrClient(media_type).get_file(int(file_id)).get("path")
-        except requests.RequestException as exc:
-            raise HTTPException(status_code=502, detail=f"Could not resolve path from *arr: {exc}") from exc
-    if not raw:
-        raise HTTPException(status_code=400, detail="Could not determine the imported file path")
-    return map_path(str(raw))
-
-
-def target_root_for(payload: dict[str, Any], media_type: str) -> str:
-    if media_type == "movie":
-        return CONFIG["movie_target_root"]
-    series_path = str(payload.get("series", {}).get("path", "")).lower()
-    if CONFIG["anime_marker"] in series_path:
-        return CONFIG["anime_tv_target_root"]
-    return CONFIG["tv_target_root"]
 
 
 @app.get("/health")
@@ -901,57 +1041,62 @@ def list_jobs(limit: int = 50) -> list[dict[str, Any]]:
     return [dict(row) for row in rows]
 
 
+@app.post("/api/download/complete", status_code=202, dependencies=[Depends(require_secret)])
+def download_complete(payload: dict[str, Any] = Body(default_factory=dict)) -> dict[str, Any]:
+    """Called by qBittorrent's "run on torrent finished" hook. This starts the pipeline."""
+    download_id = str(payload.get("hash") or "").strip()
+    content_path = str(payload.get("path") or "").strip()
+    if not download_id or not content_path:
+        raise HTTPException(status_code=400, detail="hash and path are required")
+    return ingest_download(
+        download_id,
+        str(payload.get("name") or ""),
+        str(payload.get("category") or ""),
+        content_path,
+    )
+
+
 @app.post("/api/import", status_code=202, dependencies=[Depends(require_secret)])
 def import_webhook(payload: dict[str, Any] = Body(default_factory=dict)) -> dict[str, str]:
-    event_type = payload.get("eventType")
-    if event_type == "Test":
+    """*arr's On Import webhook. Confirmation only — the pipeline no longer starts here."""
+    if payload.get("eventType") == "Test":
         return {"status": "Test successful"}
-    if event_type not in ACCEPTED_EVENT_TYPES:
-        return {"status": f"ignored event {event_type}"}
+    download_id = str(payload.get("downloadId") or "").upper()
+    if not download_id:
+        return {"status": "ignored: no downloadId"}
 
-    media_type = "series" if "series" in payload else "movie"
-    item = payload.get("series") or payload.get("movie") or {}
-    item_id = item.get("id")
-    if item_id is None:
-        raise HTTPException(status_code=400, detail="Payload contains no series/movie id")
+    imported = (payload.get("episodeFile") or payload.get("movieFile") or {}).get("path")
+    if imported:
+        for job in fetch_jobs("SELECT * FROM jobs WHERE download_id=?", (download_id,)):
+            if Path(job["work_path"] or "").stem == Path(imported).stem:
+                update_job(job["id"], imported_path=imported)
+    log.info("download %s: *arr confirmed an import (%s)", download_id[:8], imported or "path unknown")
+    return {"status": "recorded"}
 
-    path = resolve_path(payload, media_type)
-    if not within_media_roots(Path(path)):
-        raise HTTPException(status_code=400, detail=f"Path {path} is outside the configured media roots")
 
-    now = time.time()
-    with db() as conn:
-        conn.execute(
-            """
-            INSERT INTO jobs (source_path, current_path, media_type, item_id, target_root, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(source_path) DO UPDATE SET
-                current_path=excluded.current_path,
-                media_type=excluded.media_type,
-                item_id=excluded.item_id,
-                target_root=excluded.target_root,
-                state='new',
-                translation_state='pending',
-                translation_attempts=0,
-                pipeline_attempts=0,
-                subtitle_ext=NULL,
-                en_subtitle_path=NULL,
-                sv_subtitle_path=NULL,
-                untranslated_lines=0,
-                staging_dir=NULL,
-                staged_at=NULL,
-                source_duration=NULL,
-                last_size=NULL,
-                stable_checks=0,
-                arr_command_id=NULL,
-                move_deadline=NULL,
-                error_detail=NULL,
-                updated_at=excluded.updated_at
-            """,
-            (path, path, media_type, int(item_id), target_root_for(payload, media_type), now, now),
-        )
-    log.info("accepted %s import: %s", media_type, path)
-    return {"status": "accepted"}
+@app.post("/translate", dependencies=[Depends(require_secret)])
+def translate_upload(file: UploadFile = File(...)) -> Response:
+    """Translate an uploaded subtitle file and return it. Used by Bazarr's post-processing hook."""
+    suffix = Path(file.filename or "subtitle.srt").suffix.lower()
+    if suffix not in SUBTITLE_EXTENSIONS:
+        raise HTTPException(status_code=400, detail=f"unsupported subtitle format {suffix!r}")
+
+    scratch = Path(tempfile.mkdtemp(prefix="translate-", dir=str(SCRATCH_ROOT)))
+    try:
+        source = scratch / f"in{suffix}"
+        destination = scratch / f"out{suffix}"
+        source.write_bytes(file.file.read())
+        try:
+            with translation_lock:
+                untranslated = translate_subtitle_file(source, destination)
+        except FatalJobError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except Exception as exc:  # noqa: BLE001 - surfaced to the caller
+            raise HTTPException(status_code=502, detail=f"translation failed: {exc}") from exc
+        log.info("translated upload %s (%s untranslated lines)", file.filename, untranslated)
+        return Response(content=destination.read_bytes(), media_type="text/plain; charset=utf-8")
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
 
 
 # --------------------------------------------------------------------------- startup
@@ -961,24 +1106,21 @@ def preflight() -> None:
     for tool in ("ffmpeg", "ffprobe"):
         if shutil.which(tool) is None:
             raise SystemExit(f"{tool} is not installed or not on PATH")
-    for directory in (WORK_DIR, STAGING_ROOT):
+    if not DATA_ROOT.exists():
+        raise SystemExit(f"{DATA_ROOT} does not exist in this container — check the /data mount")
+    for directory in (WORK_ROOT, TRANSCODE_ROOT, SCRATCH_ROOT):
         directory.mkdir(parents=True, exist_ok=True)
         if not os.access(directory, os.W_OK):
             raise SystemExit(f"{directory} is not writable")
-    reachable = []
-    for root in MEDIA_ROOTS:
-        if root.exists():
-            reachable.append(root)
-        else:
-            log.warning("configured media root %s does not exist here; check path_map / bind mounts", root)
-    if not reachable:
-        raise SystemExit("none of the configured media_roots exist in this container")
-    if STAGING_ROOT.stat().st_dev != reachable[0].stat().st_dev:
-        log.warning(
-            "%s and %s are on different filesystems; hardlink staging to Tdarr will fail",
-            STAGING_ROOT,
-            reachable[0],
+    if COMPLETE_ROOT.exists() and COMPLETE_ROOT.stat().st_dev != WORK_ROOT.stat().st_dev:
+        log.error(
+            "%s and %s are on different filesystems — hardlinking will fail. "
+            "The whole /data tree must be a single ZFS dataset.",
+            COMPLETE_ROOT, WORK_ROOT,
         )
+    unknown = [c for c, kind in CONFIG["download_categories"].items() if kind not in ("series", "movie")]
+    if unknown:
+        raise SystemExit(f"download_categories must map to 'series' or 'movie': {unknown}")
 
 
 def main() -> None:
@@ -990,6 +1132,7 @@ def main() -> None:
     preflight()
     threading.Thread(target=pipeline_loop, name="pipeline", daemon=True).start()
     threading.Thread(target=translation_loop, name="translation", daemon=True).start()
+    threading.Thread(target=reconcile_loop, name="reconcile", daemon=True).start()
     try:
         uvicorn.run(app, host=CONFIG["listen_host"], port=CONFIG["listen_port"], log_level="warning")
     finally:

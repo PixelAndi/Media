@@ -1,38 +1,39 @@
-# AI Translator — subtitle gate between *arr imports and Tdarr
+# Media gatekeeper
 
-Extracts English subtitles from a freshly imported file **before** Tdarr can touch it,
-translates them to Swedish while Tdarr transcodes to AV1, then puts the finished media
-and the `.sv` sidecar into the cold library through Sonarr/Radarr.
+Sits between qBittorrent and the Sonarr/Radarr import. Nothing reaches the library pool until
+it is final: AV1, no embedded subtitles, Swedish sidecar beside it.
+
+The full design — storage layout, rollout phases, the old-library migration and the pool-swap
+procedure — is in [`docs/architecture.md`](docs/architecture.md). The live setup it was written
+against is recorded in [`docs/homelab-setup.md`](docs/homelab-setup.md).
 
 ```
-qbittorrent -> /complete
-                  |  hardlink
-Sonarr/Radarr -> /arr-ingest ──webhook──> ai-translator
-                                             1. wait for a stable file
-                                             2. extract the English subtitle track
-                                             3. hardlink into the Tdarr queue folder  ──> Tdarr
-                                             4. translate EN -> SV (in parallel)
-                                             5. verify Tdarr output: AV1 + no subtitles
-                                             6. swap it back into /arr-ingest, drop the .sv sidecar beside it
-                                             7. *arr rescan -> move to /library/... -> verify
+qBittorrent finishes ──webhook──▶ gatekeeper
+                                     1. hardlink media into /data/work/<job>/   (seed untouched)
+                                     2. extract the English subtitle track
+                                     3. hand the video to Tdarr via /data/transcode/<job>/<n>/
+                                     4. translate EN → SV while Tdarr encodes
+                                     5. verify: AV1, zero subtitle streams, duration matches
+                                     6. move it back beside its .sv sidecar
+                                     7. DownloadedEpisodesScan / DownloadedMoviesScan,
+                                        importMode=Move  ── the only write to the library pool
+                                     8. clean up the work folder
 ```
 
-Tdarr never sees the file until step 3, so the embedded English track can no longer be
-stripped out from under the extractor. That race was the central bug in the previous version.
+Tdarr cannot see a file until step 3, so the embedded English track can never be stripped before
+it is extracted. The race is designed out rather than timed around.
 
 ## Install
 
-```bash
-sudo mkdir -p /opt/ai-translator
-sudo cp ai_translator.py /opt/ai-translator/
-sudo cp config.example.json /opt/ai-translator/config.json
-python3 -m venv /opt/ai-translator/venv
-/opt/ai-translator/venv/bin/pip install -r requirements.txt
-sudo cp ai-translator.service /etc/systemd/system/
-sudo systemctl enable --now ai-translator
-```
+Run it as a TrueNAS app alongside the *arr stack, with `/data` mounted and `ffmpeg` on `PATH`.
+It must see the same `/data` tree as qBittorrent, Sonarr, Radarr and Tdarr, and that whole tree
+must be **one ZFS dataset** — hardlinks cannot cross datasets.
 
-`ffmpeg` and `ffprobe` must be on `PATH`. The service refuses to start without them.
+```bash
+pip install -r requirements.txt
+cp config.example.json config.json      # edit paths and categories
+python3 ai_translator.py
+```
 
 `secrets.json` (mode 600) next to the script:
 
@@ -43,100 +44,92 @@ sudo systemctl enable --now ai-translator
   "RADARR_URL": "http://10.0.0.10:7878",
   "RADARR_API_KEY": "...",
   "GEMINI_API_KEY": "...",
-  "WEBHOOK_SECRET": "a long random string"
+  "WEBHOOK_SECRET": "a long random string",
+  "QBIT_USERNAME": "optional — only for the reconcile loop",
+  "QBIT_PASSWORD": "optional"
 }
 ```
 
-Everything else lives in `config.json` — see `config.example.json`.
+A systemd unit is included for non-container deployments.
 
-## Required settings in the other services
+## Wiring
 
-**Tdarr** — point the library at `tdarr_staging_root` (e.g. `/arr-ingest/.tdarr-queue`),
-**not** at `/arr-ingest`. This is the change that closes the race.
-- The staging folder must be on the same filesystem as `/arr-ingest` (staging uses hardlinks;
-  the service logs a warning at startup if it is not).
-- The flow must output AV1 **and remove all subtitle streams**, writing the result back into
-  the same per-job folder. A file that keeps its subtitles is never accepted — the job fails
-  after `transcode_timeout_hours` with an explicit message.
+**qBittorrent** → Options → Downloads → *Run on torrent finished*:
+
+```sh
+curl -sS -X POST -H "X-Api-Key: YOUR_SECRET" -H "Content-Type: application/json" \
+  -d "{\"hash\":\"%I\",\"path\":\"%F\",\"category\":\"%L\",\"name\":\"%N\"}" \
+  http://gatekeeper:5000/api/download/complete
+```
 
 **Sonarr / Radarr**
-- Connect → Webhook → `http://<host>:5000/api/import`, method POST, triggers: *On Import* and
-  *On Upgrade* only. Add header `X-Api-Key: <WEBHOOK_SECRET>`.
-- Settings → Media Management → **Import Extra Files**, with `srt,ass` in the extensions list,
-  so the `.sv` sidecar travels with the media on a move. The service also verifies the sidecar
-  landed next to the media afterwards and relocates it itself if *arr left it behind.
+- Connect → Webhook → `http://gatekeeper:5000/api/import`, trigger **On File Import**, header
+  `X-Api-Key: YOUR_SECRET`. This is confirmation only; the pipeline no longer starts here.
+- **Completed Download Handling → Import: off.** The gatekeeper is the importer.
+- Media Management → **Import Extra Files** with `srt,ass`, so the `.sv` sidecar travels with
+  the video.
+- One root folder per content type, under `/library`.
+
+**Tdarr** — library source `/data/transcode`, transcoding in place, plugin stack producing AV1
+with all subtitles removed. Add `av1` to *Codecs to skip*; leave *Skip hardlinked files* **off**.
+
+**Bazarr** (fallback path, for releases with no embedded English track) — custom post-processing:
+
+```sh
+sh -c 'src="{{subtitles}}"; dest="${src%.*}"; dest="${dest%.en}.sv.${src##*.}"; \
+       curl -sS -H "X-Api-Key: YOUR_SECRET" -F "file=@$src" \
+       http://gatekeeper:5000/translate -o "$dest"'
+```
+
+Leave Bazarr's **Remove Tags** off so styling survives.
+
+## Endpoints
+
+| Method | Path | Purpose |
+|---|---|---|
+| POST | `/api/download/complete` | qBittorrent completion hook — starts the pipeline |
+| POST | `/api/import` | *arr On Import webhook — confirmation only |
+| POST | `/translate` | subtitle file in, Swedish subtitle out (Bazarr's hook) |
+| GET | `/api/jobs` | job list for debugging |
+| GET | `/health` | job counts by state, unauthenticated |
+
+All except `/health` require the `X-Api-Key` header.
 
 ## Behaviour worth knowing
 
-- **Nothing is ever deleted to "recover" from a failed verification.** If a move cannot be
-  confirmed, the job is marked `failed` with the reason and both copies are left in place.
-- **Formatting is preserved by masking.** Every `{\an8}`-style override tag and `\N` break is
-  replaced by a `[[n]]` token before translation and restored afterwards. If a line comes back
-  with tokens missing or duplicated, that line keeps its English text rather than losing its
-  positioning. ASS styles (outline width, colours, `PlayRes`) survive untouched via pysubs2.
-- **SRT carries no positioning or outline data at all.** When the source track is SRT the
-  styling requirement cannot be met — there is nothing to preserve. ASS/SSA tracks are
-  preferred automatically when a file has both.
-- **Image-based subtitles (PGS/VobSub) are not supported** — there is no OCR step. Those jobs
-  record that reason and continue without Swedish subtitles.
-- If translation fails permanently the media is still finished and moved
-  (`move_without_subtitles`, default `true`), with the reason recorded on the job.
-- Re-importing the same path resets the job instead of creating a duplicate.
+- **A missed webhook costs nothing.** A reconcile loop polls qBittorrent for completed torrents
+  the database has never seen and enqueues them. On its very first run it adopts the existing
+  seed list instead of ingesting all of it, then only considers completions newer than
+  `reconcile_max_age_hours`.
+- **Season packs are one unit.** A torrent with several episodes is imported once, when every
+  file in it is finished.
+- **Nothing is deleted to recover from a failure.** If an import cannot be confirmed the job is
+  marked `failed` with the reason and the files stay in the work folder for a manual import.
+- **Formatting is preserved by masking.** Every `{\an8}`-style override tag and `\N` break becomes
+  a `[[n]]` token before translation and is restored afterwards. A line that comes back with
+  tokens mangled keeps its English text rather than losing its positioning. ASS styles — outline
+  width, colours, `PlayRes` — pass through untouched.
+- **SRT carries no positioning or outline data**, so ASS/SSA tracks are preferred automatically
+  when a release has both.
+- **Image-based subtitles (PGS/VobSub) are not supported** — there is no OCR step. Those imports
+  continue without Swedish subtitles and the reason is recorded on the job.
+- If translation fails permanently the media is still imported (`import_without_subtitles`,
+  default `true`).
+- Only one translation runs at a time, whether it came from the pipeline or from Bazarr.
+
+## Tests
+
+```bash
+python3 tests/test_pipeline_e2e.py      # two-episode season pack, real ffmpeg, stubbed Gemini/*arr
+python3 tests/test_failure_paths.py     # auth, validation, timeouts, reconcile, /translate
+```
+
+Both build real media in a temp directory and need `ffmpeg`/`ffprobe` on `PATH`. The e2e run
+includes SVT-AV1 encodes standing in for Tdarr, so it takes a couple of minutes.
 
 ## Checking on it
 
 ```bash
 curl -s localhost:5000/health | jq
-curl -s -H "X-Api-Key: $WEBHOOK_SECRET" localhost:5000/api/jobs | jq '.[] | {source_path, state, translation_state, error_detail}'
-journalctl -u ai-translator -f
+curl -s -H "X-Api-Key: $SECRET" localhost:5000/api/jobs | jq '.[] | {source_path, state, translation_state, error_detail}'
 ```
-
-## Tests
-
-```bash
-python3 tests/test_pipeline_e2e.py      # full flow on real media, stubbed Gemini/*arr
-python3 tests/test_failure_paths.py     # auth, validation, timeouts, schema migration
-```
-
-Both build real files with ffmpeg in a temp directory and need `ffmpeg`/`ffprobe` on `PATH`.
-The e2e run includes an SVT-AV1 encode standing in for Tdarr, so it takes a minute.
-
-## Known limitation: ongoing series (fix agreed, not yet built)
-
-Moving a series to the cold root changes its root folder in Sonarr, so the *next* episode of
-that series imports straight into `/library/tv/...` rather than `/arr-ingest`. The pipeline
-still runs for it — the move step is skipped when the item is already in the target root — but
-that episode is transcoded in place on the cold SMR disk instead of on the ingest pool, which
-breaks the "only ever write the finished file to SMR" rule.
-
-**The fix is to run the pipeline before the import rather than after it**, so that the *arr
-import *is* the single SMR write:
-
-1. qBittorrent "Run external program on torrent finished" posts `%I` (hash), `%F` (path) and
-   `%L` (category) to a new endpoint.
-2. The service hardlinks the media out of `/complete` into a hot work folder — the torrent keeps
-   seeding, untouched.
-3. Existing pipeline, unchanged: extract English subtitles, hand to Tdarr, verify AV1 with no
-   embedded subtitles, translate to Swedish.
-4. The service then asks *arr to import that folder:
-   `DownloadedEpisodesScan` / `DownloadedMoviesScan` with `path`, `downloadClientId` (the torrent
-   hash) and `importMode: "Move"`. Verified present in current Sonarr and Radarr, both carrying a
-   "used by third-party apps, do not modify" comment on exactly those three properties.
-5. The existing `/api/import` webhook becomes the completion signal instead of the trigger — the
-   On Import payload carries `downloadId`, so jobs close deterministically rather than by polling.
-
-Series then stay permanently rooted in the cold library, and episode 2 behaves exactly like
-episode 1. This deletes the `rootFolderPath` mutation, the `MoveSeries`/`MoveMovie` commands and
-the whole move-verification path.
-
-Required configuration changes when this lands:
-- qBittorrent: the on-completion hook above.
-- Sonarr/Radarr: **turn off Completed Download Handling (Import)**, or they will import the
-  untranscoded file the moment the torrent finishes and the race is back.
-
-Tradeoff: this service becomes the importer. If it is down nothing imports until it returns —
-recoverable, since jobs persist in SQLite and the torrent stays in qBittorrent, and a manual
-import in the *arr UI always works (by then the file is already final).
-
-Open detail: a season-pack torrent holds several episodes, so a job becomes per-media-file with a
-shared download id, and the import fires once every file in the torrent is ready.
