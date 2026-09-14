@@ -66,13 +66,41 @@ you do.
 
 If (e) prints nothing, say so before Phase 4 and we will use a different hook command.
 
-### 3. Check nothing lives in the ingest root folders
+### 3. Find out what is sitting in the ingest folders
 
-In **Sonarr → Series**, and **Radarr → Movies**, look at the Path column. If any show or movie
-sits under `/nvme/arr-ingest/...`, move it to `/library/...` first (Sonarr: Edit Series → Root
-Folder → pick the `/library` one → tick "Move Files"). Let those finish before Phase 1.
+A *root folder* is the shelf Sonarr puts shows on — every show belongs to exactly one. You have
+four: two in the fast NVMe scratch area (`/nvme/arr-ingest/...`) and two in the real library
+(`/library/...`). The old design added new shows to the scratch shelf and relied on the translator
+script to carry them to the library afterwards. That script could never see your files, so that
+step has most likely never run.
 
-Nothing should be left in the ingest roots when you start.
+This matters because Phase 2 removes the scratch shelves and destroys that dataset. Anything still
+on it would be deleted with it.
+
+```sh
+du -sh /mnt/nvme-seed/arr-ingest
+du -sh /mnt/nvme-seed/arr-ingest/*/* 2>/dev/null | sort -h | tail -20
+```
+
+**If the total is a few MB** — empty folders. Nothing to do.
+
+**If it is gigabytes** — that is real content, and moving it is a Phase 5-sized job, not a warm-up.
+Do not try to move it now. Instead:
+
+- Leave the scratch shelves where they are; they harm nothing.
+- Stop *new* content landing there (next step).
+- Skip the "delete the ingest roots" step in Phase 2, and do not destroy `nvme-seed/arr-ingest`.
+- Drain it in Phase 5, in batches, alongside the old library.
+
+### 4. Point Jellyseerr at the library shelves
+
+So that nothing new lands in the scratch area from here on:
+
+- **Jellyseerr → Settings → Services → Sonarr → Edit**: Root Folder `/library/tv`,
+  Anime Root Folder `/library/anime/tv`.
+- **Jellyseerr → Settings → Services → Radarr → Edit**: Root Folder `/library/movies`.
+
+This one change is the only part of the ingest-folder question that has to happen before Phase 1.
 
 ---
 
@@ -226,8 +254,10 @@ Set user/group to 1000, and `chown -R 1000:1000 /mnt/fast-pool/Tdarr`.
 - **Radarr → Settings → Download Clients → Remote Path Mappings** — delete the entry.
 - **Bazarr → Settings → Sonarr → Path Mappings** — delete all rows. Same under **Settings → Radarr**.
 - **Sonarr → Settings → Media Management → Root Folders** — delete `/nvme/arr-ingest/tv` and
-  `/nvme/arr-ingest/anime/tv`. Leave `/library/tv` and `/library/anime/tv`.
-- **Radarr → same** — delete the two `/nvme/arr-ingest/...` roots.
+  `/nvme/arr-ingest/anime/tv`, **but only if the Prep check showed they are empty.** If they still
+  hold shows, leave them until Phase 5 has drained them. Either way, keep `/library/tv` and
+  `/library/anime/tv`.
+- **Radarr → same** — the two `/nvme/arr-ingest/...` roots, under the same condition.
 
 Start all the apps. Bazarr → System → Status should now show **no path errors**.
 
@@ -236,8 +266,10 @@ Start all the apps. Bazarr → System → Status should now show **no path error
 Once everything is running and happy:
 
 ```sh
-zfs destroy nvme-seed/arr-ingest
 zfs destroy nvme-seed/tdarr-cache
+
+# only if the Prep check showed arr-ingest is empty:
+zfs destroy nvme-seed/arr-ingest
 ```
 
 Leave `nvme-seed/torrents/incomplete` alone for now — it still holds in-progress downloads.
@@ -427,6 +459,11 @@ already on the mirrored pair, which is the right place for it. A media library i
 replaceable data you own. The new pipeline writes to the SMR disk exactly once per file, which is
 the workload SMR is actually good at. When you next add disks, `architecture.md` §8 swaps the
 library pool without touching a single app setting.
+
+**Drain the ingest scratch area the same way** if the Prep check found content there. It is the
+same job with a shorter path — `rsync` a batch from `/mnt/nvme-seed/arr-ingest/tv/...` into
+`/mnt/Media/library/tv/`, re-import it in Sonarr, delete the source batch. Once it is empty you can
+remove the ingest root folders and run `zfs destroy nvme-seed/arr-ingest`.
 
 For each batch (a few hundred GB — a handful of series, or one letter of the alphabet):
 
