@@ -126,26 +126,34 @@ These stand alone. Do them tonight even if you go no further.
 2. **Protect your subtitles until the new pipeline lands.** Tdarr → Libraries → Media → Source →
    turn **Hold Files After Scanning** on (the 1 hour duration is already set). This is currently
    the only thing preventing Tdarr from stripping an English track before anything extracts it.
-3. **Harden the two public hostnames — without locking out your remote users.**
+3. **Tighten the two public hostnames — the parts that take five minutes.**
+
+   First, the framing: Jellyfin and Jellyseerr behind Certbot TLS, each with its own login, is a
+   normal self-hosted setup. Worth improving, not worth panicking about, and it should not hold up
+   the overhaul.
 
    **Do not put an NPMplus Access List on `watch.pandi.se` or `request.pandi.se`.** An access list
    is HTTP Basic Auth in front of the whole site. TV apps, phone apps, Roku and Chromecast cannot
-   answer a basic-auth challenge, so every remote Jellyfin user would simply stop being able to
-   connect. Jellyfin and Jellyseerr already have their own logins — that is the authentication.
+   answer a basic-auth challenge, so every remote Jellyfin user would stop being able to connect.
+   Both apps already authenticate — access lists are the right tool only for something you expose
+   that has *no* login of its own.
 
-   The actual gap is that nothing filters traffic arriving *before* those logins. In NPMplus:
-   - Turn on **CrowdSec** (it ships with AppSec support). It bans IPs that hammer a login, which is
-     the real risk, and legitimate users never notice it.
-   - Add a **GeoIP2 country allowlist** if your users are all in one or two countries. This removes
-     most of the internet's background scanning and is invisible to the people who should get in.
-   - Per proxy host, enable **Block Common Exploits** and force HTTPS. Hardened TLS and the OWASP
-     security headers are already on by default in NPMplus; HSTS is worth enabling too.
+   What is actually a five-minute job, per proxy host in NPMplus:
+   - **Block Common Exploits** → on
+   - **Force SSL** → on, plus **HSTS** if your version offers it on the SSL tab
 
-   Access Lists stay the right tool for anything you expose that has *no* login of its own — not
-   for these two.
+   In Jellyfin → Dashboard → Users, check whether your build offers a per-user lockout after
+   repeated failed logins and set it. Keep Jellyfin updated, and do not let the admin account be
+   the one people watch with.
 
-   On the Jellyfin side: keep it updated, and make sure the admin account is not the one people
-   watch with day to day.
+   **Deliberately not here:** CrowdSec and GeoIP country filtering are what genuinely stop
+   brute-force attempts, but in NPMplus neither is a UI toggle. CrowdSec needs a separate CrowdSec
+   container, `LOGROTATE="true"` in the compose, and an API key from
+   `docker exec crowdsec cscli bouncers add npmplus` written into
+   `/opt/npmplus/crowdsec/crowdsec.conf`. GeoIP needs `NGINX_LOAD_GEOIP2_MODULE="true"` plus
+   hand-written `geoip2` directives in `/opt/npmplus/custom_nginx/http_top.conf`. Both are config-file
+   projects worth doing on their own, once the pipeline is finished — not mixed into a storage
+   migration.
 
 ---
 
