@@ -516,8 +516,18 @@ Existing torrents keep their old save path and keep seeding. Only new downloads 
 
 ### 2. Sonarr and Radarr
 
-- Settings → **Download Clients** → qBittorrent → **untick "Completed Download Handling → Import"**.
-  From now on the gatekeeper is the importer. Leave Failed Download Handling on.
+- Settings → **Download Clients**. The setting is **on the page itself, not inside the client
+  dialog** — scroll past the client list to the **Completed Download Handling** section and
+  **untick "Enable"** ("Automatically import completed downloads from download client"). The
+  per-client dialog only offers "Remove Completed", which is a different thing; leave it alone.
+  Leave Failed Download Handling on.
+
+  From this moment the gatekeeper is the importer, and *arr only imports when asked.
+
+  Sonarr may warn that "qBittorrent is configured to remove torrents when they reach their Share
+  Ratio Limit". That warning is defused by this design: the gatekeeper hardlinks each file as soon
+  as the download finishes, so when qBittorrent later deletes the torrent at ratio 2 only the
+  `/complete` name goes away and the data stays alive through the hardlink.
 - Settings → **Connect** → `AI WORM Gatekeeper` → set the URL to
   `http://192.168.50.45:5000/api/import`, keep the trigger on **On File Import**, and update the
   `X-Api-Key` header to your new secret.
