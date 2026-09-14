@@ -556,9 +556,19 @@ class QbitClient:
             headers={"Referer": self.base_url},
             timeout=CONFIG["arr_request_timeout"],
         )
+        if response.status_code == 403:
+            # qBittorrent bans a client after a few failed logins, and the ban outlives its cause.
+            raise PipelineError(
+                f"qBittorrent refused the login with 403 ({response.text.strip()[:120]!r}). "
+                "This is usually its failed-login ban; restart qBittorrent to clear it."
+            )
         response.raise_for_status()
         if response.text.strip() != "Ok.":
-            raise PipelineError("qBittorrent rejected the login")
+            raise PipelineError(
+                f"qBittorrent rejected the login (HTTP {response.status_code}, "
+                f"replied {response.text.strip()[:120]!r}). 'Fails.' means the username or password "
+                "is wrong as seen from this container."
+            )
         self.authenticated = True
 
     def completed_torrents(self) -> list[dict[str, Any]]:
