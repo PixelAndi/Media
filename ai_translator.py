@@ -546,44 +546,44 @@ class QbitClient:
 
     def _login(self) -> None:
         username = SECRETS.get("QBIT_USERNAME")
-        password = SECRETS.get("QBIT_PASSWORD")
         if not username:
-            self.authenticated = True  # WebUI auth bypassed for this client
+            self.authenticated = True  # no credentials configured; the API may not need them
             return
         response = self.session.post(
             f"{self.base_url}/api/v2/auth/login",
-            data={"username": username, "password": password or ""},
+            data={"username": username, "password": SECRETS.get("QBIT_PASSWORD") or ""},
             headers={"Referer": self.base_url},
             timeout=CONFIG["arr_request_timeout"],
         )
+        body = response.text.strip()
         if response.status_code == 403:
             # qBittorrent bans a client after a few failed logins, and the ban outlives its cause.
             raise PipelineError(
-                f"qBittorrent refused the login with 403 ({response.text.strip()[:120]!r}). "
-                "This is usually its failed-login ban; restart qBittorrent to clear it."
+                f"qBittorrent refused the login with 403 ({body[:120]!r}). That is usually its "
+                "failed-login ban; restart qBittorrent to clear it."
             )
+        if body == "Fails.":
+            raise PipelineError("qBittorrent rejected the username or password")
         response.raise_for_status()
-        if response.text.strip() != "Ok.":
-            raise PipelineError(
-                f"qBittorrent rejected the login (HTTP {response.status_code}, "
-                f"replied {response.text.strip()[:120]!r}). 'Fails.' means the username or password "
-                "is wrong as seen from this container."
-            )
+        # Any other 2xx counts as usable: a WebUI that bypasses auth for this subnet answers
+        # 204 with no body, which is not a refusal. The torrent list below is the real test.
         self.authenticated = True
 
     def completed_torrents(self) -> list[dict[str, Any]]:
-        if not self.authenticated:
-            self._login()
-        response = self.session.get(
-            f"{self.base_url}/api/v2/torrents/info",
-            params={"filter": "completed"},
-            timeout=CONFIG["arr_request_timeout"],
-        )
-        if response.status_code == 403:
-            self.authenticated = False
-            raise PipelineError("qBittorrent session expired")
-        response.raise_for_status()
-        return response.json()
+        for attempt in (1, 2):
+            if not self.authenticated:
+                self._login()
+            response = self.session.get(
+                f"{self.base_url}/api/v2/torrents/info",
+                params={"filter": "completed"},
+                timeout=CONFIG["arr_request_timeout"],
+            )
+            if response.status_code == 403 and attempt == 1:
+                self.authenticated = False  # session expired, log in again and retry once
+                continue
+            response.raise_for_status()
+            return response.json()
+        raise PipelineError("qBittorrent kept refusing the torrent list; check the WebUI credentials")
 
 
 # --------------------------------------------------------------------------- ingest

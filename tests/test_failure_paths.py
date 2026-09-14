@@ -228,6 +228,54 @@ assert t.import_webhook({"eventType": "Test"})["status"] == "Test successful"
 assert "ignored" in t.import_webhook({"eventType": "Download"})["status"]
 print("import webhook: test events and payloads without a downloadId are harmless")
 
+# --- qBittorrent login: 204 with no body is not a rejection -------------------
+class FakeResponse:
+    def __init__(self, status, text="", payload=None):
+        self.status_code, self.text, self._payload = status, text, payload
+
+    def json(self):
+        return self._payload
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise RuntimeError(f"HTTP {self.status_code}")
+
+
+class FakeSession:
+    def __init__(self, login, infos):
+        self.login, self.infos, self.logins = login, list(infos), 0
+
+    def post(self, url, **kw):
+        self.logins += 1
+        return self.login
+
+    def get(self, url, **kw):
+        return self.infos.pop(0)
+
+
+t.SECRETS["QBIT_USERNAME"] = "andi"
+t.SECRETS["QBIT_PASSWORD"] = "pw"
+
+client = t.QbitClient()
+client.session = FakeSession(FakeResponse(204), [FakeResponse(200, payload=[{"hash": "x"}])])
+assert client.completed_torrents() == [{"hash": "x"}], "204 with no body must not be treated as a refusal"
+print("qbit: a WebUI that bypasses auth (204, empty body) is accepted")
+
+client = t.QbitClient()
+client.session = FakeSession(FakeResponse(200, "Fails."), [])
+try:
+    client.completed_torrents(); raise SystemExit("bad credentials were accepted")
+except t.PipelineError as exc:
+    assert "username or password" in str(exc), exc
+print("qbit: 'Fails.' is still reported as bad credentials")
+
+client = t.QbitClient()
+client.session = FakeSession(FakeResponse(200, "Ok."), [FakeResponse(403), FakeResponse(200, payload=[])])
+client.authenticated = True
+assert client.completed_torrents() == []
+assert client.session.logins == 1, "an expired session should re-authenticate exactly once"
+print("qbit: an expired session re-authenticates once and retries")
+
 # --- cross-filesystem staging -------------------------------------------------
 foreign = Path("/dev/shm/gatekeeper-xdev")
 shutil.rmtree(foreign, ignore_errors=True)
