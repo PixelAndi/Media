@@ -7,8 +7,8 @@ in order, by someone who is not a programmer. Every command is copy-paste.
 a label, not data. No torrent file is copied, moved on disk, or re-checked. The container path
 qBittorrent knows them by (`/complete/...`) stays exactly the same.
 
-Where to run commands: **TrueNAS web UI → System → Shell** (the `>_` icon). Everything is one
-line unless shown otherwise.
+Where to run commands: **TrueNAS web UI → System → Shell** (the `>_` icon). Run `sudo -i` once
+when you open it — you log in as `truenas_admin`, and every command here needs root.
 
 Total time: about 2 hours of attention, spread over as many evenings as you like. Each phase
 ends with the system working.
@@ -19,9 +19,12 @@ ends with the system working.
 
 **Every app in the chain must run as the same user.** qBittorrent downloads a file, the
 gatekeeper hardlinks it, Tdarr rewrites it, Sonarr moves it. If they run as different users,
-Linux quietly refuses some of those steps — and "quietly" is the problem.
+Linux quietly refuses some of those steps — and "quietly" is the problem. Linux also blocks
+hardlinking a file you do not own, which is the single thing this whole design rests on.
 
-qBittorrent already runs as user `1000`, group `1000`. We will make everything match it.
+Your apps run as **`568:568`** — the TrueNAS apps user. Sonarr and Radarr are official apps, so
+rather than reconfiguring them, we move the two custom apps (qBittorrent and the gatekeeper) to
+568 and chown the data to match. Nothing official gets touched.
 
 ---
 
@@ -60,13 +63,22 @@ zfs list -r nvme-seed
 docker exec qbittorrent which curl
 ```
 
-If (c) shows anything other than `1000 1000` for sonarr or radarr, note the numbers — you will
-change those apps to `1000:1000` in Phase 2, and you will need to chown their config dataset when
-you do.
+Whatever numbers (c) shows are the user everything else gets aligned to. On this server it is
+`568 568`.
 
 If (e) prints nothing, say so before Phase 4 and we will use a different hook command.
 
-### 3. Find out what is sitting in the ingest folders
+### 3. What these checks showed on this server (14 Sep 2026)
+
+- Hardlinks: **not working** — every import stored a second full copy.
+- `arr-ingest` **392 G** (movies 345 G, anime/tv 44.9 G, tv 1.75 G), `torrents/complete` 470 G,
+  `tdarr-cache` 224 K (already empty), **74.3 G free**.
+- Sonarr and Radarr run as **568:568**.
+- qBittorrent has `curl`.
+
+Phase 0.5 below exists because of the first two.
+
+### 4. Find out what is sitting in the ingest folders
 
 A *root folder* is the shelf Sonarr puts shows on — every show belongs to exactly one. You have
 four: two in the fast NVMe scratch area (`/nvme/arr-ingest/...`) and two in the real library
@@ -92,7 +104,7 @@ Do not try to move it now. Instead:
 - Skip the "delete the ingest roots" step in Phase 2, and do not destroy `nvme-seed/arr-ingest`.
 - Drain it in Phase 5, in batches, alongside the old library.
 
-### 4. Point Jellyseerr at the library shelves
+### 5. Point Jellyseerr at the library shelves
 
 So that nothing new lands in the scratch area from here on:
 
@@ -111,17 +123,57 @@ These stand alone. Do them tonight even if you go no further.
 1. **Rotate the Radarr API key.** Radarr → Settings → General → API Key → the circular arrow.
    It was legible in the screenshots you sent. Afterwards update it in Prowlarr, Bazarr and
    Jellyseerr, which all store a copy.
-2. **Free ~389 GiB.** Tdarr's transcode cache is full of abandoned work:
-   ```sh
-   du -sh /mnt/nvme-seed/tdarr-cache
-   rm -rf /mnt/nvme-seed/tdarr-cache/*
-   ```
-3. **Protect your subtitles until the new pipeline lands.** Tdarr → Libraries → Media → Source →
+2. **Protect your subtitles until the new pipeline lands.** Tdarr → Libraries → Media → Source →
    turn **Hold Files After Scanning** on (the 1 hour duration is already set). This is currently
    the only thing preventing Tdarr from stripping an English track before anything extracts it.
-4. **Lock down the two public hostnames.** NPMplus → Access Lists → create one → add your own
+3. **Lock down the two public hostnames.** NPMplus → Access Lists → create one → add your own
    username/password → apply it to `request.pandi.se` and `watch.pandi.se`. Both are currently
    open to the internet with no restriction.
+
+---
+
+## Phase 0.5 — free the space (one evening, mostly unattended)
+
+**Do this before Phase 1.** `arr-ingest` holds 392 GiB of media that Sonarr and Radarr already
+track but Jellyfin cannot see. Moving it to the library frees the space that makes everything
+else comfortable, and takes the pool from 92 % to roughly 50 %.
+
+**Use the *arr bulk editors, not rsync.** These files are in Sonarr's and Radarr's databases.
+Their own editors move the files *and* update the database in one action. (rsync is the right
+tool for the old `Andi` library in Phase 5, where nothing tracks the files — it is the wrong tool
+here.)
+
+### Sonarr — two passes, because anime has its own shelf
+
+1. Series → switch on the **Mass Editor** (select mode) at the bottom of the list.
+2. Sort by **Path** so the `/nvme/arr-ingest/anime/tv/...` shows group together. Select them.
+3. At the bottom set **Root Folder** → `/library/anime/tv` → **Apply**.
+4. When it asks whether to move the files, say **yes**.
+5. Repeat for the shows under `/nvme/arr-ingest/tv` → `/library/tv` (only 1.75 GiB, quick).
+
+### Radarr — one pass, and this is the big one
+
+Movies → **Movie Editor** → sort by Path → select everything under `/nvme/arr-ingest/movies` →
+**Root Folder** → `/library/movies` → **Apply** → yes, move the files.
+
+That is 345 GiB going to the SMR disk. Expect it to run for several hours — start it and leave it.
+Nothing else should be writing to that disk while it works.
+
+### When both are empty
+
+```sh
+du -sh /mnt/nvme-seed/arr-ingest
+zfs destroy -r nvme-seed/arr-ingest
+zfs list -o name,used,avail -r nvme-seed
+```
+
+You should now have roughly 466 GiB free. Also delete the two ingest root folders in Sonarr and
+Radarr (Settings → Media Management → Root Folders) — they are empty now, so the Phase 2 warning
+about them no longer applies.
+
+**One thing to decide, and it is fine to skip:** some of that backlog is x265 rather than AV1.
+Converting it is a separate one-off job you can point Tdarr at later, against `/library`. It is
+not part of getting the new pipeline working, and the new pipeline never revisits old files.
 
 ---
 
@@ -167,7 +219,7 @@ not a copy.
 ### 4. One owner for everything
 
 ```sh
-chown -R 1000:1000 /mnt/nvme-seed/data
+chown -R 568:568 /mnt/nvme-seed/data
 chmod 775 /mnt/nvme-seed/data /mnt/nvme-seed/data/torrents /mnt/nvme-seed/data/torrents/complete \
           /mnt/nvme-seed/data/work /mnt/nvme-seed/data/transcode /mnt/nvme-seed/data/cache
 ```
@@ -188,11 +240,22 @@ rm -f /mnt/nvme-seed/data/torrents/complete/_hltest /mnt/nvme-seed/data/work/_hl
 Apps → qBittorrent → Edit → Custom Config. Change the volumes block to:
 
 ```yaml
+    environment:
+      - PUID=568
+      - PGID=568
+      - WEBUI_PORT=8080
     volumes:
       - /mnt/fast-pool/qbittorrent/config:/config
       - /mnt/nvme-seed/data/torrents/complete:/complete
       - /mnt/nvme-seed/torrents/incomplete:/incomplete
       - /mnt/nvme-seed/data:/data
+```
+
+The `PUID`/`PGID` change is what puts qBittorrent on the same user as everything else. Its config
+needs to follow:
+
+```sh
+chown -R 568:568 /mnt/fast-pool/qbittorrent /mnt/nvme-seed/torrents/incomplete
 ```
 
 The `/complete` line is the important one: the host path changed, the container path did not.
@@ -223,21 +286,12 @@ For each app: **Apps → the app → Edit → Storage**.
 | `/complete` | `/data` → `/mnt/nvme-seed/data` |
 | `/nvme` | (keep `/library` → `/mnt/Media/library`) |
 
-Also on the Edit page, set **User ID 1000 / Group ID 1000** if it is not already. If you change
-it, first run:
-
-```sh
-chown -R 1000:1000 /mnt/fast-pool/sonarr /mnt/fast-pool/radarr
-```
+Leave the User ID and Group ID alone — they are already 568, which is what everything else now matches.
 
 ### Bazarr
 
 Change its one storage entry from `/Media/library` to **`/library`** → `/mnt/Media/library`.
-Set user/group to 1000 as above, and:
-
-```sh
-chown -R 1000:1000 /mnt/fast-pool/bazarr
-```
+Leave its user/group as they are.
 
 ### Tdarr
 
@@ -245,8 +299,8 @@ chown -R 1000:1000 /mnt/fast-pool/bazarr
 |---|---|
 | `/ingest`, `/complete`, `/tdarr-cache`, `/Library`, `/dont_media` | `/data` → `/mnt/nvme-seed/data` |
 
-Set the **Tdarr Transcode Storage** host path to `/mnt/nvme-seed/data/cache`.
-Set user/group to 1000, and `chown -R 1000:1000 /mnt/fast-pool/Tdarr`.
+Set the **Tdarr Transcode Storage** host path to `/mnt/nvme-seed/data/cache`. Leave its
+user/group as they are.
 
 ### Now delete the mappings that exist only because paths differed
 
@@ -267,10 +321,9 @@ Once everything is running and happy:
 
 ```sh
 zfs destroy nvme-seed/tdarr-cache
-
-# only if the Prep check showed arr-ingest is empty:
-zfs destroy nvme-seed/arr-ingest
 ```
+
+`nvme-seed/arr-ingest` was already destroyed at the end of Phase 0.5.
 
 Leave `nvme-seed/torrents/incomplete` alone for now — it still holds in-progress downloads.
 
@@ -315,7 +368,7 @@ Paste this, filling in your own values (`Ctrl+O`, `Enter`, `Ctrl+X` to save):
 
 ```sh
 chmod 600 /mnt/fast-pool/gatekeeper/secrets.json
-chown -R 1000:1000 /mnt/fast-pool/gatekeeper
+chown -R 568:568 /mnt/fast-pool/gatekeeper
 ```
 
 ### 3. Edit config.json
@@ -342,7 +395,7 @@ services:
     image: python:3.12-slim
     container_name: gatekeeper
     restart: unless-stopped
-    user: "1000:1000"
+    user: "568:568"
     ports:
       - "5000:5000"
     environment:
