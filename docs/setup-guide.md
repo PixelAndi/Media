@@ -126,9 +126,26 @@ These stand alone. Do them tonight even if you go no further.
 2. **Protect your subtitles until the new pipeline lands.** Tdarr → Libraries → Media → Source →
    turn **Hold Files After Scanning** on (the 1 hour duration is already set). This is currently
    the only thing preventing Tdarr from stripping an English track before anything extracts it.
-3. **Lock down the two public hostnames.** NPMplus → Access Lists → create one → add your own
-   username/password → apply it to `request.pandi.se` and `watch.pandi.se`. Both are currently
-   open to the internet with no restriction.
+3. **Harden the two public hostnames — without locking out your remote users.**
+
+   **Do not put an NPMplus Access List on `watch.pandi.se` or `request.pandi.se`.** An access list
+   is HTTP Basic Auth in front of the whole site. TV apps, phone apps, Roku and Chromecast cannot
+   answer a basic-auth challenge, so every remote Jellyfin user would simply stop being able to
+   connect. Jellyfin and Jellyseerr already have their own logins — that is the authentication.
+
+   The actual gap is that nothing filters traffic arriving *before* those logins. In NPMplus:
+   - Turn on **CrowdSec** (it ships with AppSec support). It bans IPs that hammer a login, which is
+     the real risk, and legitimate users never notice it.
+   - Add a **GeoIP2 country allowlist** if your users are all in one or two countries. This removes
+     most of the internet's background scanning and is invisible to the people who should get in.
+   - Per proxy host, enable **Block Common Exploits** and force HTTPS. Hardened TLS and the OWASP
+     security headers are already on by default in NPMplus; HSTS is worth enabling too.
+
+   Access Lists stay the right tool for anything you expose that has *no* login of its own — not
+   for these two.
+
+   On the Jellyfin side: keep it updated, and make sure the admin account is not the one people
+   watch with day to day.
 
 ---
 
