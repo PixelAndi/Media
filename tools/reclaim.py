@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import sys
 import urllib.error
@@ -67,6 +68,43 @@ def to_host(path: str, maps: list[tuple[str, str]]) -> Path:
         if path == container or path.startswith(container.rstrip("/") + "/"):
             return (Path(host) / Path(path[len(container):].lstrip("/"))).resolve()
     return Path(path).resolve()
+
+
+def fingerprint(path: Path, size: int) -> str | None:
+    """Cheap content identity: size plus the first and last megabyte.
+
+    Two media files that agree on all three are the same release for any practical
+    purpose, and it costs 2 MB of reads instead of hashing 21 GB.
+    """
+    chunk = 1024 * 1024
+    digest = hashlib.sha256(str(size).encode())
+    try:
+        with path.open("rb") as handle:
+            digest.update(handle.read(chunk))
+            if size > chunk * 2:
+                handle.seek(-chunk, 2)
+                digest.update(handle.read(chunk))
+    except OSError:
+        return None
+    return digest.hexdigest()
+
+
+def identical_groups(rows: list[dict]) -> list[list[dict]]:
+    """Files that are byte-for-byte the same release under different names."""
+    by_size: dict[int, list[dict]] = {}
+    for row in rows:
+        by_size.setdefault(row["size_bytes"], []).append(row)
+    groups: list[list[dict]] = []
+    for candidates in by_size.values():
+        if len(candidates) < 2:
+            continue
+        by_print: dict[str, list[dict]] = {}
+        for row in candidates:
+            mark = fingerprint(Path(row["path"]), row["size_bytes"])
+            if mark:
+                by_print.setdefault(mark, []).append(row)
+        groups.extend(group for group in by_print.values() if len(group) > 1)
+    return groups
 
 
 def library_index(library: Path, exclude: Path | None = None) -> dict[tuple[str, int], Path]:
@@ -241,6 +279,27 @@ def main() -> None:
                   f"  so nothing here is tracked and ORPHAN above is the real answer.\n"
                   "  That does not make it deletable: an orphan may still be the only copy.\n"
                   "  Import what you want to keep first, then delete the rest.")
+
+    if args.root == args.library:
+        print("\n  note: the surveyed folder IS the library root, so nothing can be compared\n"
+              "  against it — the DUPLICATE check is inactive in this run.")
+
+    print(f"\nChecking for identical files under different names …", flush=True)
+    groups = identical_groups(rows)
+    if groups:
+        waste = sum(sum(r["size_bytes"] for r in g[1:]) for g in groups)
+        print(f"\n{'=' * 78}\nIDENTICAL COPIES — {len(groups)} group(s), "
+              f"{human(waste)} reclaimable\n{'=' * 78}")
+        for group in sorted(groups, key=lambda g: -g[0]["size_bytes"])[:20]:
+            print(f"  {group[0]['size']:>8}  x{len(group)}")
+            for row in group:
+                print(f"            {row['path']}")
+        if len(groups) > 20:
+            print(f"  … and {len(groups) - 20} more group(s)")
+        print("\n  Same size and same first and last megabyte — the same release twice.\n"
+              "  Keep one of each; the rest are free space.")
+    else:
+        print("  none found.")
 
     print(f"\n{'=' * 78}\nTotals")
     for kind, (count, total) in sorted(buckets.items(), key=lambda kv: -kv[1][1]):
