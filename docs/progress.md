@@ -2,7 +2,7 @@
 
 Living status of the overhaul. Update this at the end of each working session.
 
-**Last updated:** 14 Sep 2026, end of session · branch `claude/magical-noether-halmjq`
+**Last updated:** 15 Sep 2026 · branch `claude/magical-noether-halmjq`
 
 ---
 
@@ -28,6 +28,27 @@ has finished since the gatekeeper started. That is the next thing to do.
 | 5 — old library migration | not started | 2.26 TiB in `/mnt/Andi/Media/Library`. |
 
 ---
+
+## First live test — what it found (15 Sep)
+
+Four jobs ran. The pipeline's own stages all worked: staging, hardlinking, subtitle extraction and
+the qBittorrent hook. Everything that failed was downstream config or a design gap:
+
+1. **Gemini model name wrong.** `gemini-2.5-flash` 404s for this API key, so every translation
+   failed three times and gave up. Fix: list the key's real models and set `translation.model` in
+   `config.json`. The code now says this outright instead of logging a bare 404.
+2. **Tdarr processed nothing for 12 hours.** Container `ix-tdarr-tdarr-1` is up and healthy, so the
+   question is whether it can see `/data/transcode` (mount) or is holding the files (Hold Files
+   After Scanning, turned on in Phase 0 and never turned back off in Phase 4 step 3).
+3. **Already-AV1 releases deadlocked** — fixed in code. Tdarr skips AV1 files, which skipped the
+   subtitle strip too, so the job waited out the whole timeout with 22 embedded streams. The
+   gatekeeper now remuxes the subtitles away itself (`-map 0 -map -0:s -c copy`, seconds, no
+   re-encode) and bypasses Tdarr. Verified the hardlinked seed keeps its own inode and subtitles.
+4. **A failed job used to be a dead end** — `INSERT OR IGNORE` on `source_path` meant re-firing the
+   webhook did nothing. Added `POST /api/jobs/{id}/retry` and `jobs.py --retry-failed`.
+
+Not a bug: `[Tonkatsu Fansub]` reported "no English subtitle track found" and was right — its only
+subtitle track is tagged `ita`. Bazarr is the designed fallback for releases like that.
 
 ## Pick up here
 
@@ -86,6 +107,14 @@ requested).
 - Apps run as **568:568** (the TrueNAS apps user). Sonarr and Radarr are official apps, so the two
   custom apps (qBittorrent, gatekeeper) were moved onto 568 rather than the other way round.
 - Ports: Sonarr `:30113`, Radarr `:30025`, qBittorrent `:8080`, gatekeeper `:5000`.
+- **Container names.** Official TrueNAS apps are `ix-<app>-<service>-1`; the two custom apps keep
+  plain names. So it is `docker exec qbittorrent …` and `docker exec gatekeeper …`, but
+  `docker exec ix-tdarr-tdarr-1 …`, `ix-sonarr-sonarr-1`, `ix-radarr-radarr-1`,
+  `ix-bazarr-bazarr-1`, `ix-prowlarr-prowlarr-1`, `ix-seerr-seerr-1`. Guessing `tdarr` wastes a
+  round trip — `docker ps --format '{{.Names}}'` settles it.
+- **The TrueNAS web shell mangles multi-line pastes** — lines overwrite each other and Python gets
+  garbage. Give single-line commands, or put the script in the repo and curl it down. That is why
+  `tools/jobs.py` exists.
 - Gatekeeper code lives at `/mnt/fast-pool/gatekeeper` on the host, mounted as `/config`. The image
   is plain `python:3.12-slim` — Docker cannot clone a repo, the code arrives via the volume.
 - Work pool is `nvme-seed/data` → `/mnt/nvme-seed/data`, mounted as `/data` everywhere. Library is
