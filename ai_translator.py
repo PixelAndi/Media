@@ -1119,6 +1119,34 @@ def retry_job(job_id: int) -> dict[str, Any]:
     return {"status": "retrying", "id": job_id}
 
 
+@app.post("/api/jobs/{job_id}/retranslate", dependencies=[Depends(require_secret)])
+def retranslate_job(job_id: int) -> dict[str, Any]:
+    """Give a job's translation another go without disturbing its pipeline state.
+
+    A translation that exhausted its attempts stays failed forever, even once the cause is
+    gone — an expired API key, a depleted quota, an outage. The job itself is often still
+    moving, so it cannot be retried through the failed-job path.
+    """
+    rows = fetch_jobs("SELECT * FROM jobs WHERE id=?", (job_id,))
+    if not rows:
+        raise HTTPException(status_code=404, detail=f"no job with id {job_id}")
+    job = rows[0]
+    if job["state"] not in (STATE_NEW, STATE_TRANSCODING, STATE_TRANSCODED):
+        raise HTTPException(
+            status_code=409,
+            detail=f"job {job_id} is {job['state']}; its subtitle has already been placed. "
+                   "Use Bazarr to fetch and translate one for it instead.",
+        )
+    if not job["en_subtitle_path"] or not Path(job["en_subtitle_path"]).exists():
+        raise HTTPException(
+            status_code=409,
+            detail=f"job {job_id} has no extracted English subtitle to translate",
+        )
+    update_job(job_id, translation_state=TR_PENDING, translation_attempts=0, error_detail=None)
+    log.info("job %s: translation queued again", job_id)
+    return {"status": "retranslating", "id": job_id}
+
+
 @app.post("/api/download/complete", status_code=202, dependencies=[Depends(require_secret)])
 def download_complete(payload: dict[str, Any] = Body(default_factory=dict)) -> dict[str, Any]:
     """Called by qBittorrent's "run on torrent finished" hook. This starts the pipeline."""

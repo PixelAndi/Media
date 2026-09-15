@@ -9,6 +9,7 @@ and none ends up in shell history. Run it on the TrueNAS host:
     python3 .../jobs.py --full             # every field of every job
     python3 .../jobs.py --retry 4          # put one failed job back in the queue
     python3 .../jobs.py --retry-failed     # put every failed job back
+    python3 .../jobs.py --retranslate-all  # re-queue translations that gave up
 
 Only the standard library, because the host python has no third-party packages.
 """
@@ -96,10 +97,27 @@ def main() -> None:
     parser.add_argument("--full", action="store_true", help="dump every field as JSON")
     parser.add_argument("--retry", type=int, metavar="ID", help="requeue one failed job")
     parser.add_argument("--retry-failed", action="store_true", help="requeue every failed job")
+    parser.add_argument("--retranslate", type=int, metavar="ID", help="re-queue one job's translation")
+    parser.add_argument("--retranslate-all", action="store_true",
+                        help="re-queue every translation that gave up, without touching pipeline state")
     args = parser.parse_args()
 
     secret = load_secret(args.home)
     base = args.url.rstrip("/")
+
+    if args.retranslate is not None or args.retranslate_all:
+        if args.retranslate is not None:
+            targets = [args.retranslate]
+        else:
+            targets = [j["id"] for j in fetch(f"{base}/api/jobs?limit=500", secret)
+                       if j.get("translation_state") == "failed"]
+            if not targets:
+                print("Nothing to re-translate — no failed translations.")
+                return
+        for job_id in targets:
+            result = post(f"{base}/api/jobs/{job_id}/retranslate", secret)
+            print(f"job {job_id}: {result.get('error') or result.get('status', result)}")
+        return
 
     if args.retry is not None or args.retry_failed:
         if args.retry is not None:
