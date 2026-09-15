@@ -446,15 +446,18 @@ def call_gemini(prompt: str) -> dict[str, str]:
         headers={"x-goog-api-key": SECRETS["GEMINI_API_KEY"]},
         timeout=settings["request_timeout"],
     )
-    if response.status_code == 404:
-        # Google answers 404 for a model this key cannot use, which reads like a broken URL.
+    if not response.ok:
+        # Google puts the actual reason in the body; the status line alone is useless here.
+        # A 404 can mean the model does not exist, is retired, or does not serve
+        # generateContent on this API version - three different fixes, one status code.
+        try:
+            reason = response.json().get("error", {}).get("message", "")
+        except ValueError:
+            reason = response.text[:300]
         raise PipelineError(
-            f"Gemini has no model {CONFIG['translation']['model']!r} for this API key. "
-            "List the ones it does have with: curl -s "
-            "'https://generativelanguage.googleapis.com/v1beta/models?key=YOUR_KEY' "
-            "and put one of those in config.json under translation.model."
+            f"Gemini refused the request for model {CONFIG['translation']['model']!r} "
+            f"({response.status_code}): {reason or 'no detail given'}"
         )
-    response.raise_for_status()
     body = response.json()
     candidates = body.get("candidates") or []
     if not candidates:
