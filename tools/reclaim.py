@@ -93,6 +93,8 @@ def main() -> None:
     parser.add_argument("--map", action="append", default=None, metavar="CONTAINER=HOST",
                         help=f"path translation, repeatable (default: {' '.join(DEFAULT_MAPS)})")
     parser.add_argument("--csv", type=Path, help="also write a row per file here")
+    parser.add_argument("--paths", action="store_true",
+                        help="show how each library path translates to a host path, and stop")
     parser.add_argument("--min-size", type=int, default=50_000_000,
                         help="ignore files smaller than this (default 50MB)")
     args = parser.parse_args()
@@ -122,6 +124,26 @@ def main() -> None:
         if item.get("path"):
             tracked.append((to_host(item["path"], maps), f"Radarr: {item.get('title', '?')}"))
     print(f"  {len(series)} series, {len(movies)} movies known\n")
+
+    if args.paths:
+        print("Container path -> host path, and whether that host path exists.\n"
+              "A column of 'MISSING' means the --map translation is wrong, and every file\n"
+              "under those folders would be misreported as an orphan.\n")
+        seen = set()
+        for base, label in sorted(tracked, key=lambda item: str(item[0])):
+            if base in seen:
+                continue
+            seen.add(base)
+            mark = "ok     " if base.is_dir() else "MISSING"
+            print(f"  [{mark}] {label}\n             {base}")
+        raw = sorted({item.get("path", "") for item in series + movies if item.get("path")})
+        print(f"\nDistinct prefixes the databases actually use:")
+        prefixes = sorted({"/".join(path.split("/")[:3]) for path in raw})
+        for prefix in prefixes:
+            print(f"  {prefix}")
+        print("\nIf a prefix above has no --map entry, add one:  "
+              "--map /that/prefix=/mnt/real/host/path")
+        return
 
     print(f"Indexing {args.library} …")
     library = library_index(args.library)
@@ -191,6 +213,19 @@ def main() -> None:
                 print(f"            {row['tracked_by']}")
         if len(group) > 40:
             print(f"  … and {len(group) - 40} more (use --csv for the full list)")
+
+    missing = [base for base, _ in tracked if not base.is_dir()]
+    if (series or movies) and not by_verdict.get("TRACKED"):
+        print(f"\n{'!' * 78}\n"
+              "NOTHING was matched to a library database, but the databases are not empty.\n"
+              "That normally means the container-to-host path translation is wrong, in which\n"
+              "case tracked files are being reported as ORPHAN. Do not delete anything on the\n"
+              "strength of this run — check the translation first:\n\n"
+              "    python3 reclaim.py --paths\n"
+              f"{'!' * 78}")
+    elif missing:
+        print(f"\n  note: {len(missing)} library path(s) do not exist on this host — "
+              "run with --paths to see which, since files under them read as orphans")
 
     print(f"\n{'=' * 78}\nTotals")
     for kind, (count, total) in sorted(buckets.items(), key=lambda kv: -kv[1][1]):
