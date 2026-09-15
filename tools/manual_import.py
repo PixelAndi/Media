@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 import urllib.error
 import urllib.parse
@@ -55,6 +56,52 @@ def human(size: float) -> str:
     return f"{size:.1f}T"
 
 
+SEASON_EPISODE = re.compile(r"[Ss](\d{1,3})[\s._-]*[Ee](\d{1,4})")
+AIR_DATE = re.compile(r"(\d{4})[-._](\d{2})[-._](\d{2})")
+
+
+def force_match(items: list[dict], app: str, series_id: int, base: str, key: str) -> None:
+    """Assign every unmatched file to one title, matching episodes ourselves.
+
+    Sonarr's manualimport endpoint does not accept a seriesId filter — passing one returns
+    nothing at all — so the mapping is done here: SxxExx or an air date out of the filename,
+    looked up against that series' own episode list.
+    """
+    if app == "radarr":
+        for item in items:
+            if not item.get("movie"):
+                item["movie"] = {"id": series_id, "title": f"(forced id {series_id})"}
+        return
+
+    episodes = call(base, key, f"episode?seriesId={series_id}")
+    if not isinstance(episodes, list) or not episodes:
+        sys.exit(f"Sonarr returned no episodes for series id {series_id}.")
+    title = (episodes[0].get("series") or {}).get("title") or f"(forced id {series_id})"
+    by_number = {(e.get("seasonNumber"), e.get("episodeNumber")): e for e in episodes}
+    by_date = {e["airDate"]: e for e in episodes if e.get("airDate")}
+
+    for item in items:
+        if item.get("episodes"):
+            continue
+        name = Path(item.get("path", "")).name
+        episode = None
+        match = SEASON_EPISODE.search(name)
+        if match:
+            episode = by_number.get((int(match.group(1)), int(match.group(2))))
+        if episode is None:
+            match = AIR_DATE.search(name)
+            if match:
+                episode = by_date.get(f"{match.group(1)}-{match.group(2)}-{match.group(3)}")
+        if episode is None:
+            continue
+        item["series"] = {"id": series_id, "title": title}
+        item["episodes"] = [episode]
+        item["seasonNumber"] = episode.get("seasonNumber")
+        # The app rejected these only because it could not name the series.
+        item["rejections"] = [r for r in item.get("rejections", [])
+                              if "unknown series" not in str(r.get("reason", "")).lower()]
+
+
 def describe(item: dict, app: str) -> tuple[str, bool]:
     """Return a one-line summary and whether this file is safe to import."""
     name = Path(item.get("path", "?")).name
@@ -64,7 +111,13 @@ def describe(item: dict, app: str) -> tuple[str, bool]:
     if app == "sonarr":
         target = (item.get("series") or {}).get("title")
         episodes = item.get("episodes") or []
-        detail = f"{target} — {len(episodes)} episode(s)" if target else "NO SERIES MATCH"
+        if target and episodes:
+            numbers = ", ".join(f"S{e.get('seasonNumber', 0):02d}E{e.get('episodeNumber', 0):02d}"
+                                + (f" {e['title']}" if e.get("title") else "")
+                                for e in episodes[:2])
+            detail = f"{target} — {numbers}"
+        else:
+            detail = target or "NO SERIES MATCH"
         ready = bool(target and episodes)
     else:
         target = (item.get("movie") or {}).get("title")
@@ -134,17 +187,15 @@ def main() -> None:
         print(f"\nPass one of those with --id to force the match.")
         return
 
-    params = {"folder": args.folder, "filterExistingFiles": "false"}
-    if args.id is not None:
-        # Sonarr and Radarr will match episodes or the movie within this title instead of
-        # parsing the filename, which is what rescues date-named and bare-titled releases.
-        params["seriesId" if args.app == "sonarr" else "movieId"] = str(args.id)
-    query = urllib.parse.urlencode(params)
+    query = urllib.parse.urlencode({"folder": args.folder, "filterExistingFiles": "false"})
     print(f"Asking {args.app} what it finds in {args.folder} …\n")
     items = call(base, key, f"manualimport?{query}")
     if not isinstance(items, list) or not items:
         sys.exit("Nothing came back. Check the folder path as the CONTAINER sees it "
                  "(/nvme/... not /mnt/nvme-seed/...), and that the app has that mount.")
+
+    if args.id is not None:
+        force_match(items, args.app, args.id, base, key)
 
     ready, skipped = [], []
     for item in items:
