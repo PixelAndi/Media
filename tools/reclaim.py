@@ -127,8 +127,10 @@ def main() -> None:
 
     if args.paths:
         print("Container path -> host path, and whether that host path exists.\n"
-              "A column of 'MISSING' means the --map translation is wrong, and every file\n"
-              "under those folders would be misreported as an orphan.\n")
+              "A few MISSING lines are normal — a title that is monitored but never\n"
+              "downloaded has no folder yet. It is only a problem when they are ALL missing,\n"
+              "which means the --map translation is wrong and every tracked file would be\n"
+              "misreported as an orphan.\n")
         seen = set()
         for base, label in sorted(tracked, key=lambda item: str(item[0])):
             if base in seen:
@@ -214,18 +216,23 @@ def main() -> None:
         if len(group) > 40:
             print(f"  … and {len(group) - 40} more (use --csv for the full list)")
 
-    missing = [base for base, _ in tracked if not base.is_dir()]
+    # Distinguish "the translation is broken" from "nothing here is tracked, genuinely".
+    # Both show TRACKED = 0, and they call for opposite actions.
+    inside = [base for base, _ in tracked if base == args.root or args.root in base.parents]
+    resolvable = [base for base, _ in tracked if base.is_dir()]
     if (series or movies) and not by_verdict.get("TRACKED"):
-        print(f"\n{'!' * 78}\n"
-              "NOTHING was matched to a library database, but the databases are not empty.\n"
-              "That normally means the container-to-host path translation is wrong, in which\n"
-              "case tracked files are being reported as ORPHAN. Do not delete anything on the\n"
-              "strength of this run — check the translation first:\n\n"
-              "    python3 reclaim.py --paths\n"
-              f"{'!' * 78}")
-    elif missing:
-        print(f"\n  note: {len(missing)} library path(s) do not exist on this host — "
-              "run with --paths to see which, since files under them read as orphans")
+        if not resolvable:
+            print(f"\n{'!' * 78}\n"
+                  "No library path resolves to a real folder on this host, so the\n"
+                  "container-to-host translation is wrong and tracked files are being\n"
+                  "reported as ORPHAN. Do not delete anything on the strength of this run:\n\n"
+                  "    python3 reclaim.py --paths\n"
+                  f"{'!' * 78}")
+        elif not inside:
+            print(f"\n  Every library entry points somewhere outside {args.root},\n"
+                  f"  so nothing here is tracked and ORPHAN above is the real answer.\n"
+                  "  That does not make it deletable: an orphan may still be the only copy.\n"
+                  "  Import what you want to keep first, then delete the rest.")
 
     print(f"\n{'=' * 78}\nTotals")
     for kind, (count, total) in sorted(buckets.items(), key=lambda kv: -kv[1][1]):
