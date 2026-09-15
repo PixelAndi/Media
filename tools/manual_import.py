@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+from collections import Counter
 import sys
 import urllib.error
 import urllib.parse
@@ -196,6 +197,27 @@ def main() -> None:
 
     if args.id is not None:
         force_match(items, args.app, args.id, base, key)
+
+    # Radarr trusts the enclosing folder name over the filenames, so scanning a movie
+    # folder that has become a dumping ground maps every unrelated episode to that movie.
+    # One movie is one file; dozens mapping to the same title is always wrong.
+    if args.app == "radarr" and args.id is None:
+        counts = Counter((item.get("movie") or {}).get("id") for item in items
+                         if (item.get("movie") or {}).get("id"))
+        for movie_id, count in counts.items():
+            if count <= 3:
+                continue
+            title = next((item["movie"].get("title") for item in items
+                          if (item.get("movie") or {}).get("id") == movie_id), movie_id)
+            sys.exit(
+                f"REFUSING: {count} files in this folder all matched the single movie "
+                f"{title!r}.\n\n"
+                "Radarr matches on the enclosing folder name, so a movie folder that has\n"
+                "become a dumping ground maps everything inside it to that one movie.\n"
+                "Importing would file all of them as that movie.\n\n"
+                "Scan the real subfolders instead (a series tree belongs to Sonarr), or move\n"
+                "the loose movie files somewhere neutral and scan that."
+            )
 
     ready, skipped = [], []
     for item in items:
