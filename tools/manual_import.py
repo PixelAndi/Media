@@ -106,6 +106,11 @@ def main() -> None:
     parser.add_argument("--mode", default="move", choices=("move", "copy"),
                         help="move frees the source pool; copy leaves it (default: move)")
     parser.add_argument("--limit", type=int, help="import at most this many files this run")
+    parser.add_argument("--find", metavar="TEXT",
+                        help="list series/movies whose title contains TEXT, with their ids, and stop")
+    parser.add_argument("--id", type=int, metavar="N",
+                        help="force everything in the folder to this series/movie id, for releases "
+                             "whose filenames carry no recognisable title")
     args = parser.parse_args()
 
     try:
@@ -116,7 +121,25 @@ def main() -> None:
     prefix = "SONARR" if args.app == "sonarr" else "RADARR"
     base, key = secrets[f"{prefix}_URL"], secrets[f"{prefix}_API_KEY"]
 
-    query = urllib.parse.urlencode({"folder": args.folder, "filterExistingFiles": "false"})
+    if args.find:
+        endpoint = "series" if args.app == "sonarr" else "movie"
+        needle = args.find.lower()
+        hits = [item for item in call(base, key, endpoint)
+                if needle in str(item.get("title", "")).lower()]
+        if not hits:
+            sys.exit(f"No {endpoint} title contains {args.find!r}.")
+        for item in sorted(hits, key=lambda i: i["title"]):
+            print(f"  id {item['id']:<5} {item['title']}")
+            print(f"            {item.get('path', '')}")
+        print(f"\nPass one of those with --id to force the match.")
+        return
+
+    params = {"folder": args.folder, "filterExistingFiles": "false"}
+    if args.id is not None:
+        # Sonarr and Radarr will match episodes or the movie within this title instead of
+        # parsing the filename, which is what rescues date-named and bare-titled releases.
+        params["seriesId" if args.app == "sonarr" else "movieId"] = str(args.id)
+    query = urllib.parse.urlencode(params)
     print(f"Asking {args.app} what it finds in {args.folder} …\n")
     items = call(base, key, f"manualimport?{query}")
     if not isinstance(items, list) or not items:
@@ -136,8 +159,12 @@ def main() -> None:
         print("\n  These stay where they are. Unmatched usually means a release name the app\n"
               "  cannot parse; rejected usually means it already has that file.")
 
+    if skipped and args.id is None and args.app == "sonarr":
+        print("\n  If a whole show is unmatched because its filenames carry no title, find its\n"
+              "  id with --find \"part of the name\" and re-run with --id N to force the match.")
+
     if not args.do_import:
-        print(f"\nNothing was changed. Re-run with --import --limit 5 to move the matched files.")
+        print(f"\nNothing was changed. Re-run with --import --limit 25 to move the matched files.")
         return
     if not ready:
         sys.exit("\nNothing importable — not sending anything.")
