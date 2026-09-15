@@ -196,7 +196,15 @@ def check_gemini(secrets: dict, config: dict) -> None:
         reason = json.loads(body).get("error", {}).get("message", "")[:160]
     except ValueError:
         reason = body[:160]
-    if "api key" in reason.lower() or status in (401, 403):
+    if status >= 500:
+        # Google's own capacity, not anything on this server.
+        record(WARN, "Gemini", f"{status}: {reason}",
+               "transient overload at Google's end — wait and re-run this check; "
+               "the pipeline retries on its own")
+        return
+    if status == 429 or "quota" in reason.lower() or "credits" in reason.lower():
+        fix = "out of quota or credits — top up at https://ai.studio/projects"
+    elif "api key" in reason.lower() or status in (401, 403):
         fix = "GEMINI_API_KEY in secrets.json is not accepted — regenerate it at aistudio.google.com"
     else:
         fix = ("list the models this key can use with: curl -s "
@@ -276,6 +284,21 @@ def check_stale_handoffs(gatekeeper: str, transcode_root: str, hours: float) -> 
         record(OK, "Tdarr throughput", "nothing sitting stale in the queue")
 
 
+SUFFIXES = {"K": 1e3, "M": 1e6, "G": 1e9, "T": 1e12, "P": 1e15}
+
+
+def as_bytes(value: str) -> float | None:
+    """Parse a zfs size like '895G' or '1.60T'."""
+    value = value.strip()
+    if not value or value == "-":
+        return None
+    try:
+        return float(value[:-1]) * SUFFIXES[value[-1].upper()] if value[-1].upper() in SUFFIXES \
+            else float(value)
+    except ValueError:
+        return None
+
+
 def check_space() -> None:
     code, out = run(["zfs", "list", "-o", "name,used,avail", "-H"])
     if code != 0:
@@ -285,9 +308,17 @@ def check_space() -> None:
         if len(parts) < 3 or "/" in parts[0]:
             continue
         name, used, avail = parts[0], parts[1], parts[2]
-        low = avail.endswith("G") and float(avail[:-1]) < 100
-        record(WARN if low else OK, f"pool {name}", f"{used} used, {avail} free",
-               "under 100G free — ZFS slows badly above about 80% full" if low else "")
+        used_b, avail_b = as_bytes(used), as_bytes(avail)
+        detail = f"{used} used, {avail} free"
+        # Judge by proportion, not an absolute figure: a 30G boot pool that is 88% empty is
+        # healthy, and a 900G work pool with 65G left is not.
+        if used_b is None or avail_b is None or used_b + avail_b == 0:
+            record(OK, f"pool {name}", detail)
+            continue
+        free_pct = avail_b / (used_b + avail_b) * 100
+        detail += f" ({free_pct:.0f}% free)"
+        record(WARN if free_pct < 20 else OK, f"pool {name}", detail,
+               "ZFS slows badly past about 80% full" if free_pct < 20 else "")
 
 
 def summarise_jobs(jobs: list[dict]) -> None:
