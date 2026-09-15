@@ -69,17 +69,25 @@ def to_host(path: str, maps: list[tuple[str, str]]) -> Path:
     return Path(path).resolve()
 
 
-def library_index(library: Path) -> dict[tuple[str, int], Path]:
-    """Every library file, keyed by (name, size) — enough to spot an identical copy."""
+def library_index(library: Path, exclude: Path | None = None) -> dict[tuple[str, int], Path]:
+    """Every library file, keyed by (name, size) — enough to spot an identical copy.
+
+    *exclude* drops one subtree, which matters when surveying a folder that is itself
+    inside the library: without it every file matches itself and reads as a duplicate.
+    """
     index: dict[tuple[str, int], Path] = {}
     if not library.is_dir():
         return index
     for path in library.rglob("*"):
-        if path.is_file() and path.suffix.lower() in MEDIA_EXTENSIONS:
-            try:
-                index[(path.name, path.stat().st_size)] = path.resolve()
-            except OSError:
-                continue
+        if not (path.is_file() and path.suffix.lower() in MEDIA_EXTENSIONS):
+            continue
+        resolved = path.resolve()
+        if exclude and (resolved == exclude or exclude in resolved.parents):
+            continue
+        try:
+            index[(path.name, resolved.stat().st_size)] = resolved
+        except OSError:
+            continue
     return index
 
 
@@ -148,7 +156,7 @@ def main() -> None:
         return
 
     print(f"Indexing {args.library} …")
-    library = library_index(args.library)
+    library = library_index(args.library, exclude=args.root)
     print(f"  {len(library)} media files in the library\n")
 
     def owner(path: Path) -> str | None:
