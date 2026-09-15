@@ -2,7 +2,7 @@
 
 Living status of the overhaul. Update this at the end of each working session.
 
-**Last updated:** 15 Sep 2026 · branch `claude/magical-noether-halmjq`
+**Last updated:** 15 Sep 2026, end of session · branch `claude/magical-noether-halmjq`
 
 ---
 
@@ -50,28 +50,72 @@ the qBittorrent hook. Everything that failed was downstream config or a design g
 Not a bug: `[Tonkatsu Fansub]` reported "no English subtitle track found" and was right — its only
 subtitle track is tagged `ita`. Bazarr is the designed fallback for releases like that.
 
-## Pick up here
+## Pick up here — an import is running overnight
 
-The live test. Nothing is broken — there has simply been nothing to process.
+**A Sonarr ManualImport of 268 files is in flight** (command 130040, queued ~end of session). It
+moves the misfiled content out of `/mnt/Media/library/movies/Mad God (2021) [imdbid-tt15090124]/`
+into the correct series folders. It runs inside Sonarr, so shells and sessions closing do not
+affect it. Do **not** queue another import until it finishes — that would double-queue files
+already in flight.
 
-Evidence from the last session: the newest completed torrent finished at 11:04 local; the
-gatekeeper started at 12:14 local. `/api/jobs` returns `[]` because no download has finished since
-it came up. Everything else was proven working — service up, API key correct, and a POST from
-*inside* the qBittorrent container returned `202 Accepted`.
+First thing next session:
 
-So:
+```sh
+find "/mnt/Media/library/movies/Mad God (2021) [imdbid-tt15090124]" -name '*.mkv' | wc -l
+zfs list -o name,used,avail Media nvme-seed
+```
 
-1. Request one episode of an ongoing show in Jellyseerr.
-2. Watch it in **qBittorrent's Web UI** until it hits 100%. The gatekeeper does nothing at all
-   before that, so `[]` during the download is correct.
-   - Stalled at 0% → dead release, pick another.
-   - Absent from qBittorrent → Sonarr never grabbed it; check Sonarr → Activity → Queue, then History.
-3. Then `curl -s -H "X-Api-Key: <secret>" http://192.168.50.45:5000/api/jobs; echo` — a job should
-   appear within ~5 s, and walk `new → transcoding → transcoded → importing → done`.
+The count should have walked down from 341 toward **20**. If it is still high, check
+**Sonarr → Activity → History** — the imports are slow, several hundred GB of moves.
 
-Full detail in `setup-guide.md` §Phase 4 step 5.
+To re-establish the working shell (these do not survive a logout):
 
----
+```sh
+mis() { python3 /mnt/fast-pool/gatekeeper/manual_import.py --app sonarr "$@"; }
+mir() { python3 /mnt/fast-pool/gatekeeper/manual_import.py --app radarr "$@"; }
+L="/library/movies/Mad God (2021) [imdbid-tt15090124]"
+```
+
+Quiet probe: `mis --folder "$L" | grep -E '^(MATCHED|NOT IMPORT)'`
+
+### Then the 20 stragglers
+
+| What | Count | Fix |
+|---|---|---|
+| `[AnimeRG]` Ghibli films | 11 | Not in Radarr at all. Add each in Radarr → Add New, then `mir` picks them up. |
+| Loose movies — Hokum, The Odyssey, SAO Ordinal Scale, Spirited Away, `mad.god…mkv` | 5 | Move to a neutral folder (`/mnt/Media/library/_sortme`) and run `mir --folder "/library/_sortme"`. **Never** point Radarr at the Mad God folder — see the trap below. |
+| Re:ZERO S04E15, S04E16 | 2 | Sonarr already holds better copies. Genuinely redundant, safe to delete. |
+| `Reacher S03E04 [bit][]-d3g.mkv` | 1 | Malformed name, Sonarr cannot tell if it is a sample. Rename sanely and re-run. |
+| `S03ED-Kotoba ni Dekinai` | 1 | An ending-theme clip, not an episode. |
+
+### Still outstanding from earlier
+
+- **`arr-ingest` is down to 89.6 G** from 392 G. What remains: Sword Art Online S02 (38 G, matches
+  cleanly), the `TV/` tree's Gaki (~93 files, needs `--id 48`) and FREEZE (10 files, `--id 54`,
+  already verified correct), and `anime/tv` (9.9 G, 10 files, matches cleanly). Then
+  `zfs destroy -r nvme-seed/arr-ingest`.
+- **Tdarr still consumes nothing** from `/data/transcode`. Container healthy, `/data` mounted, queue
+  readable — so it is a setting in Tdarr's own UI. Prime suspect remains *Hold Files After Scanning*,
+  turned on in Phase 0 and never turned back off.
+- **Gemini** works now (`gemini-flash-latest`, credits added). A 503 seen once was Google's capacity.
+- **Bazarr is writing 238-byte junk subtitles.** Its post-processing curl uses `-o "$dest"` and saves
+  the body whatever the status, so every failed translation left a fake `.sv.srt` — visible next to
+  the 2001 file. Add `--fail` to that command and sweep up the ones already written.
+
+## Tools now on the server (`/mnt/fast-pool/gatekeeper/`)
+
+All read-only unless told otherwise; all stdlib-only; all read credentials from `secrets.json`.
+
+| Tool | What it does |
+|---|---|
+| `doctor.py` | One command, checks every moving part — secrets, config, *arr and qBittorrent reachability, a real Gemini call, container mounts, a live hardlink probe, Tdarr throughput, pool space, failed jobs — with the fix printed beside each failure. |
+| `jobs.py` | Gatekeeper job list with `error_detail`; `--retry-failed`, `--retranslate-all`. |
+| `reclaim.py` | Surveys a folder: TRACKED / ORPHAN / DUPLICATE, hardlink counts, and identical files under different names. |
+| `manual_import.py` | Drives Sonarr/Radarr manual import from the shell. `--find`, `--id`, `--import`, `--limit`. |
+
+Pull them with the commit hash rather than the branch name — raw.githubusercontent caches the
+branch and will serve a stale copy:
+`curl -fsSL "https://raw.githubusercontent.com/PixelAndi/Media/<sha>/tools/<file>" -o /mnt/fast-pool/gatekeeper/<file>`
 
 ## Open items
 
@@ -150,6 +194,21 @@ requested).
 - The reconcile loop polls qBittorrent every 5 minutes and catches anything the completion hook
   missed, but only for torrents completing **after** its first-run watermark (set 14 Sep 19:14 UTC).
   Anything older was adopted as existing seed and will never enter the pipeline.
+
+## Traps found the hard way
+
+- **Radarr matches on the enclosing folder name, not the filenames.** Probing the Mad God folder
+  with Radarr matched all 403 files — South Park, The Expanse, Squid Game, everything — to the
+  single movie *Mad God*. Importing that would have filed them all as one film. `manual_import.py`
+  now refuses when more than three files map to one movie. **Sonarr does not have this problem**; it
+  reads filenames, which is why `mis --folder "$L"` sorts the same tree correctly.
+- **A ZFS snapshot pins deleted blocks.** Files moved out of `arr-ingest` freed no space until
+  `zfs destroy -r nvme-seed/arr-ingest@before-overhaul`. `nvme-seed/data@before-overhaul` is
+  deliberately kept — that is the rollback for the storage reshape.
+- **Imports are queued, not synchronous.** The tool returns as soon as Sonarr accepts the command,
+  so a probe run straight afterwards still lists files that are about to move. Wait between rounds.
+- **`--id` makes the tool trust you about the series.** Point it at the wrong folder and it will
+  happily file one show's episodes as another. Keep each run scoped to one show's own directory.
 
 ## Standing rules
 
