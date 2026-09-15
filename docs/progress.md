@@ -75,7 +75,30 @@ Full detail in `setup-guide.md` §Phase 4 step 5.
 
 ## Open items
 
-**Mad God folder — do not delete.** Roughly 345 G under `/mnt/nvme-seed/arr-ingest/movies/`. It
+**Mad God folder — surveyed 15 Sep, it is a relocation job, not a delete job.**
+
+`tools/reclaim.py` settled what is in there. Findings:
+
+- **Every Sonarr and Radarr entry points at `/library`. None points into `arr-ingest`**, so all
+  356 G there is unreferenced — but unreferenced is not disposable. Most of it is the only copy.
+- **Root cause:** Radarr's *Mad God* has its path set to `/library/dest_media`, an empty 25 K stub
+  left over from the old Tdarr transfer. Folders named `Mad God (2021) [imdbid-tt15090124]` in
+  both `arr-ingest/movies/` and `library/movies/` became dumping grounds for an unrelated transfer.
+- **The 74 G `2001.A.Space.Odyssey` REMUX is the only copy** — Radarr's 2001 folder is empty.
+  Importing that one file is a fifth of the problem and takes nvme-seed from 66 G to ~140 G free.
+- Also stranded and not in the library: Star Trek SNW S04 (2160p), PLUR1BUS S01 (2160p), Star Trek
+  TNG, Downtown no Gaki no Tsukai, The Creep Tapes S02, and the missing Mushoku Tensei S03E09/10/12.
+- Sword Art Online S02 is split: `arr-ingest` has E01–E24, `library/movies/Mad God …/` has ~E09–E23.
+  Neither is complete; the ingest copy is the fuller one.
+
+**The fix is Manual Import with Move**, not deletion — it relocates the file *and* records it in the
+database, and moving to the Media pool (6.4 T free) drains nvme-seed at the same time. Sonarr and
+Radarr both reach the area at `/nvme/arr-ingest` (host `/mnt/nvme-seed`). Order: 2001 first, then
+the `TV/` tree in Sonarr, then the anime paths, then SAO. One at a time — parallel copies are what
+make SMR pathological. Whatever Manual Import cannot match is the real junk; delete that, then
+`zfs destroy nvme-seed/arr-ingest`.
+
+**Old note, superseded:** Roughly 345 G under `/mnt/nvme-seed/arr-ingest/movies/`. It
 looked like junk; the screenshots proved it is misplaced real media, including the episodes missing
 from `arr-ingest/tv`. Plan:
 
