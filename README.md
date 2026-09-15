@@ -129,6 +129,17 @@ includes SVT-AV1 encodes standing in for Tdarr, so it takes a couple of minutes.
 
 ## Checking on it
 
+`tools/doctor.py` checks every moving part at once — secrets, config, the *arr APIs, qBittorrent,
+the Gemini model, container mounts, hardlink capability, whether Tdarr is actually consuming its
+queue, pool free space — and prints the fix beside each failure. Run it on the host before asking
+why something is stuck:
+
+```bash
+python3 tools/doctor.py
+python3 tools/jobs.py                  # job list with error_detail
+python3 tools/jobs.py --retry-failed   # requeue everything that failed
+```
+
 ```bash
 curl -s localhost:5000/health | jq
 curl -s -H "X-Api-Key: $SECRET" localhost:5000/api/jobs | jq '.[] | {source_path, state, translation_state, error_detail}'
