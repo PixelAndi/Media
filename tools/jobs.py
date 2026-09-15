@@ -7,6 +7,8 @@ and none ends up in shell history. Run it on the TrueNAS host:
     python3 /mnt/fast-pool/gatekeeper/tools/jobs.py
     python3 .../jobs.py --state failed     # only the failures
     python3 .../jobs.py --full             # every field of every job
+    python3 .../jobs.py --retry 4          # put one failed job back in the queue
+    python3 .../jobs.py --retry-failed     # put every failed job back
 
 Only the standard library, because the host python has no third-party packages.
 """
@@ -56,6 +58,17 @@ def fetch(url: str, secret: str) -> list[dict]:
     return payload
 
 
+def post(url: str, secret: str) -> dict:
+    request = urllib.request.Request(url, data=b"", headers={"X-Api-Key": secret}, method="POST")
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            return json.loads(response.read() or b"{}")
+    except urllib.error.HTTPError as exc:
+        return {"error": f"{exc.code} {exc.read().decode(errors='replace')[:120]}"}
+    except urllib.error.URLError as exc:
+        return {"error": str(exc.reason)}
+
+
 def describe(job: dict) -> str:
     name = job.get("download_name") or Path(job.get("source_path", "?")).name
     lines = [f"[{job.get('state', '?')}] {name}"]
@@ -81,9 +94,28 @@ def main() -> None:
     parser.add_argument("--url", default="http://127.0.0.1:5000", help="gatekeeper base URL")
     parser.add_argument("--state", help="show only jobs in this state (new, transcoding, failed, done, ...)")
     parser.add_argument("--full", action="store_true", help="dump every field as JSON")
+    parser.add_argument("--retry", type=int, metavar="ID", help="requeue one failed job")
+    parser.add_argument("--retry-failed", action="store_true", help="requeue every failed job")
     args = parser.parse_args()
 
-    jobs = fetch(f"{args.url.rstrip('/')}/api/jobs?limit=500", load_secret(args.home))
+    secret = load_secret(args.home)
+    base = args.url.rstrip("/")
+
+    if args.retry is not None or args.retry_failed:
+        if args.retry is not None:
+            targets = [args.retry]
+        else:
+            targets = [j["id"] for j in fetch(f"{base}/api/jobs?limit=500", secret)
+                       if j.get("state") == "failed"]
+            if not targets:
+                print("Nothing to retry — no failed jobs.")
+                return
+        for job_id in targets:
+            result = post(f"{base}/api/jobs/{job_id}/retry", secret)
+            print(f"job {job_id}: {result.get('error') or result.get('status', result)}")
+        return
+
+    jobs = fetch(f"{base}/api/jobs?limit=500", secret)
     if args.state:
         jobs = [j for j in jobs if j.get("state") == args.state]
 

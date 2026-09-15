@@ -360,6 +360,31 @@ def pick_english_subtitle(info: dict[str, Any]) -> dict[str, Any] | None:
     return min(candidates, key=lambda item: item[0])[1]
 
 
+def strip_subtitles(media: Path) -> None:
+    """Remove every embedded subtitle stream in place, without re-encoding.
+
+    Tdarr skips a file that is already AV1, which means it never strips that file's
+    subtitles either — so the pipeline would wait out the whole transcode timeout for a
+    condition Tdarr was never going to satisfy. A remux does it here instead: no
+    re-encode, no quality loss, seconds rather than the hours a second AV1 pass costs.
+
+    *media* is a hardlink to the seeding torrent, so replacing it swaps only this name.
+    The torrent's own name in the complete folder keeps pointing at the original file.
+    """
+    temp = media.with_name(f".{media.stem}.nosubs{media.suffix}")
+    result = subprocess.run(
+        ["ffmpeg", "-y", "-nostdin", "-v", "error", "-i", str(media),
+         "-map", "0", "-map", "-0:s", "-c", "copy", str(temp)],
+        capture_output=True,
+        text=True,
+        timeout=CONFIG["ffmpeg_timeout"],
+    )
+    if result.returncode != 0 or not temp.exists():
+        temp.unlink(missing_ok=True)
+        raise PipelineError(f"could not remux the subtitles away: {result.stderr.strip()[:300]}")
+    os.replace(temp, media)
+
+
 def extract_subtitle(media: Path, stream: dict[str, Any], destination: Path) -> None:
     codec = stream["codec_name"]
     # mov_text carries no styling, so let ffmpeg convert it; everything else copies verbatim.
@@ -695,8 +720,13 @@ def handle_new(job: sqlite3.Row) -> None:
                    translation_state=TR_PENDING)
         log.info("job %s: extracted English subtitles from %s", job["id"], work_path.name)
 
-    if is_av1(info) and not streams_of_type(info, "subtitle"):
-        log.info("job %s: already AV1 with no embedded subtitles, skipping Tdarr", job["id"])
+    if is_av1(info):
+        embedded = streams_of_type(info, "subtitle")
+        if embedded:
+            strip_subtitles(work_path)
+            log.info("job %s: already AV1, remuxed away %s embedded subtitle stream(s)",
+                     job["id"], len(embedded))
+        log.info("job %s: already AV1, skipping Tdarr", job["id"])
         update_job(job["id"], state=STATE_TRANSCODED, work_dir=str(work_dir),
                    work_path=str(work_path), source_duration=duration,
                    last_size=work_path.stat().st_size, stable_checks=0)
@@ -1049,6 +1079,33 @@ def health() -> dict[str, Any]:
 def list_jobs(limit: int = 50) -> list[dict[str, Any]]:
     rows = fetch_jobs("SELECT * FROM jobs ORDER BY updated_at DESC LIMIT ?", (max(1, min(limit, 500)),))
     return [dict(row) for row in rows]
+
+
+@app.post("/api/jobs/{job_id}/retry", dependencies=[Depends(require_secret)])
+def retry_job(job_id: int) -> dict[str, Any]:
+    """Put a failed job back at the start of the pipeline. Nothing on disk is touched."""
+    rows = fetch_jobs("SELECT * FROM jobs WHERE id=?", (job_id,))
+    if not rows:
+        raise HTTPException(status_code=404, detail=f"no job with id {job_id}")
+    job = rows[0]
+    if job["state"] != STATE_FAILED:
+        raise HTTPException(status_code=409, detail=f"job {job_id} is {job['state']}, not failed")
+    update_job(
+        job_id,
+        state=STATE_NEW,
+        error_detail=None,
+        staged_at=None,
+        transcode_dir=None,
+        last_size=None,
+        stable_checks=0,
+        import_command_id=None,
+        import_deadline=None,
+        pipeline_attempts=0,
+        translation_state=TR_PENDING,
+        translation_attempts=0,
+    )
+    log.info("job %s: reset for another attempt", job_id)
+    return {"status": "retrying", "id": job_id}
 
 
 @app.post("/api/download/complete", status_code=202, dependencies=[Depends(require_secret)])
